@@ -1,0 +1,42 @@
+# Local Passer data may contain API keys, tokens, history, and user files.
+PasserData/
+
+# PyInstaller and other generated output.
+build/
+dist/
+
+# Bundled third-party executables and DLLs are not Passer source code.
+tools/
+
+# Python caches and test output.
+__pycache__/
+*.py[cod]
+*.pyd
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+# Virtual environments and machine-local configuration.
+.venv/
+venv/
+env/
+.env
+.env.*
+.idea/
+.vscode/
+
+# Logs, temporary files, and credential material.
+*.log
+*.tmp
+*.bak
+*.token
+*.pem
+*.key
+*.pfx
+*.p12
+
+# Operating-system metadata.
+Thumbs.db
+.DS_Store
