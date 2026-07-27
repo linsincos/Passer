@@ -250,6 +250,69 @@ class OpenClawBridgeTests(unittest.TestCase):
         with self.assertRaises(PermissionError):
             app._dispatch_openclaw_request("status", {})
 
+    def test_aira_mobile_uses_independent_narrower_allowlist(self):
+        app = Passer.RelayDockApp.__new__(Passer.RelayDockApp)
+        app.settings = {"aira_mobile_enabled": True}
+        app.items = [object()]
+        app.root = type("Root", (), {"winfo_viewable": lambda self: 1})()
+        app.ai_enabled_var = type("Value", (), {"get": lambda self: True})()
+        app.execute_ai_actions = lambda actions: [f"ran:{actions[0]['action']}"]
+        app.summon_window = lambda: None
+        status = app._dispatch_aira_mobile_request("status", {})
+        self.assertNotIn("add_target", status["allowed_actions"])
+        opened = app._dispatch_aira_mobile_request("open_tool", {"tool": "计算器"})
+        self.assertEqual(opened["messages"], ["ran:open_tool"])
+        with self.assertRaises(PermissionError):
+            app._dispatch_aira_mobile_request("add_target", {"target": "C:\\secret"})
+        app.settings["aira_mobile_enabled"] = False
+        with self.assertRaises(PermissionError):
+            app._dispatch_aira_mobile_request("status", {})
+
+    def test_aira_mobile_can_list_and_add_but_not_delete_tasks(self):
+        app = Passer.RelayDockApp.__new__(Passer.RelayDockApp)
+        app.settings = {"aira_mobile_enabled": True}
+        app.items = []
+        app.automations = []
+        app.root = type("Root", (), {"winfo_viewable": lambda self: 1})()
+        app.ai_enabled_var = type("Value", (), {"get": lambda self: True})()
+        app.aira_service = None
+        app.save_automations = mock.Mock()
+        app._refresh_automation_window = mock.Mock()
+        added = app._dispatch_aira_mobile_request("add_task", {
+            "title": "手机创建的任务",
+            "prompt": "总结今天的工作并通知我",
+            "mode": "once",
+            "when": "2099-01-02 09:30",
+        })
+        self.assertEqual(added["task"]["title"], "手机创建的任务")
+        self.assertEqual(len(app.automations), 1)
+        app.automations[0].update({
+            "_running": True,
+            "_run_started_at": "2099-01-02T09:30:00",
+            "_run_updated_at": "2099-01-02T09:31:00",
+            "_run_stage": "正在执行电脑操作（1 项）",
+            "_run_round": 2,
+            "_run_preview": "正在整理今天的工作记录",
+        })
+        listed = app._dispatch_aira_mobile_request("list_tasks", {})
+        self.assertEqual(listed["count"], 1)
+        self.assertEqual(listed["active_count"], 1)
+        self.assertEqual(listed["refresh_after_ms"], 2500)
+        self.assertEqual(listed["tasks"][0]["title"], "手机创建的任务")
+        self.assertTrue(listed["tasks"][0]["running"])
+        self.assertEqual(listed["tasks"][0]["run_round"], 2)
+        self.assertEqual(
+            listed["tasks"][0]["run_stage"],
+            "正在执行电脑操作（1 项）",
+        )
+        self.assertEqual(
+            listed["tasks"][0]["run_preview"],
+            "正在整理今天的工作记录",
+        )
+        app.save_automations.assert_called_once()
+        with self.assertRaises(PermissionError):
+            app._dispatch_aira_mobile_request("delete_task", {"id": "anything"})
+
     def test_openclaw_registry_definition_can_be_disabled(self):
         commands = []
 

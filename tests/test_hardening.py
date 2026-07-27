@@ -68,6 +68,36 @@ class _DummyApp:
         self.status.append(message)
 
 
+class AutomationPersistenceTests(unittest.TestCase):
+    def test_runtime_progress_is_never_persisted_and_stale_flags_are_removed(self):
+        with tempfile.TemporaryDirectory() as folder:
+            path = Path(folder) / "automations.json"
+            task = {
+                "id": "task-1",
+                "title": "测试任务",
+                "prompt": "完成测试",
+                "mode": "daily",
+                "_running": True,
+                "_run_stage": "正在执行",
+                "_run_preview": "临时进度",
+            }
+            with mock.patch.object(Passer, "AUTOMATIONS_FILE", path):
+                Passer.save_automations([task])
+                saved = json.loads(path.read_text(encoding="utf-8"))
+                self.assertNotIn("_running", saved[0])
+                self.assertNotIn("_run_preview", saved[0])
+
+                saved[0]["_running"] = True
+                saved[0]["_run_stage"] = "异常退出前状态"
+                path.write_text(
+                    json.dumps(saved, ensure_ascii=False),
+                    encoding="utf-8",
+                )
+                loaded = Passer.load_automations()
+                self.assertNotIn("_running", loaded[0])
+                self.assertNotIn("_run_stage", loaded[0])
+
+
 class FileShareHardeningTests(unittest.TestCase):
     def test_v3_challenge_auth_and_transfer(self):
         with tempfile.TemporaryDirectory() as folder:
@@ -202,6 +232,7 @@ class SettingsHardeningTests(unittest.TestCase):
                 aira_usage_notify_mode="passer",
                 aira_font_size="特大",
                 aira_line_spacing="宽松",
+                aira_mobile_enabled=True,
                 openclaw_enabled=True,
             )
             raw = json.loads(Passer.SETTINGS_FILE.read_text(encoding="utf-8"))
@@ -209,12 +240,14 @@ class SettingsHardeningTests(unittest.TestCase):
             self.assertEqual(raw["aira_usage_notify_mode"], "passer")
             self.assertEqual(raw["aira_font_size"], "特大")
             self.assertEqual(raw["aira_line_spacing"], "宽松")
+            self.assertTrue(raw["aira_mobile_enabled"])
             self.assertTrue(raw["openclaw_enabled"])
             settings = Passer.load_settings()
             self.assertTrue(settings["aira_usage_reminder_enabled"])
             self.assertEqual(settings["aira_usage_notify_mode"], "passer")
             self.assertEqual(settings["aira_font_size"], "特大")
             self.assertEqual(settings["aira_line_spacing"], "宽松")
+            self.assertTrue(settings["aira_mobile_enabled"])
             self.assertTrue(settings["openclaw_enabled"])
 
     def test_json_transaction_rolls_back_every_file(self):

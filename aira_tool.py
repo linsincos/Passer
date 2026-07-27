@@ -16,6 +16,7 @@ from tkinter import messagebox
 from typing import Callable
 
 from clicker_tool import ClickerTheme
+from aira_mobile_bridge import AiraMobileBridge
 
 
 AIRA_TITLE = "Aira"
@@ -746,8 +747,20 @@ class AiraService:
         self._history_lock = threading.Lock()
         self.history = self._load_history()
         self.usage_reminder = AiraUsageReminder(app, self.data_dir)
+        self.mobile_bridge = AiraMobileBridge(
+            self.data_dir / "Phone",
+            self._dispatch_mobile_action,
+            status_callback=self._publish_mobile_status,
+            unexpected_callback=self._log_mobile_unexpected,
+        )
         if bool(self.app.settings.get("aira_usage_reminder_enabled", False)):
             self.usage_reminder.start()
+        if bool(self.app.settings.get("aira_mobile_enabled", False)):
+            try:
+                self.mobile_bridge.start()
+            except OSError as exc:
+                self.app.settings["aira_mobile_enabled"] = False
+                self.mobile_bridge._last_error = str(exc)
 
     @property
     def data_dir(self) -> Path:
@@ -846,12 +859,77 @@ class AiraService:
     def usage_status_text(self) -> str:
         return self.usage_reminder.status_text()
 
+    @property
+    def mobile_running(self) -> bool:
+        return self.mobile_bridge.running
+
+    def mobile_status_text(self) -> str:
+        return self.mobile_bridge.status_text()
+
+    def start_mobile_bridge(self) -> None:
+        self.mobile_bridge.start()
+
+    def stop_mobile_bridge(self) -> None:
+        self.mobile_bridge.stop()
+
+    def reset_mobile_code(self) -> str:
+        return self.mobile_bridge.reset_code()
+
+    def _dispatch_mobile_action(self, action: str, params: dict) -> dict:
+        """Move a phone request onto Tk's UI thread and return its real result."""
+        done = threading.Event()
+        result: dict[str, object] = {}
+
+        def apply() -> None:
+            try:
+                handler = getattr(self.app, "_dispatch_aira_mobile_request", None)
+                if not callable(handler):
+                    raise RuntimeError("当前 Passer 版本不支持手机 Aira 控制。")
+                result["value"] = handler(action, params)
+            except BaseException as exc:  # transferred back to the network worker
+                result["error"] = exc
+            finally:
+                done.set()
+
+        try:
+            self.app.root.after(0, apply)
+        except tk.TclError as exc:
+            raise RuntimeError("Passer 窗口正在关闭。") from exc
+        if not done.wait(35.0):
+            raise TimeoutError("Passer 手机动作等待超时。")
+        error = result.get("error")
+        if isinstance(error, BaseException):
+            raise error
+        value = result.get("value")
+        return value if isinstance(value, dict) else {"value": value}
+
+    def _publish_mobile_status(self) -> None:
+        def apply() -> None:
+            window = getattr(self.app, "aira_window", None)
+            if window is not None and not getattr(window, "closed", True):
+                window.refresh_mobile_status()
+
+        self._post(apply)
+
+    def _log_mobile_unexpected(
+        self, exc: BaseException, action: str, target_path: Path
+    ) -> None:
+        logger = getattr(self.app, "_log_unexpected", None)
+        if callable(logger):
+            logger(
+                exc,
+                module="aira.mobile",
+                action=str(action or "unknown"),
+                target_path=target_path,
+            )
+
     def close(self) -> None:
         self.running = False
         self._stop_event.set()
         self._wake_event.set()
         self.reader.stop_channel()
         self.usage_reminder.close()
+        self.mobile_bridge.close()
 
     def check_now(self) -> None:
         if self.running:
@@ -1629,6 +1707,7 @@ class AiraWindow:
         )
         self.usage_status_var = tk.StringVar(value=service.usage_status_text())
         self.openclaw_status_var = tk.StringVar()
+        self.mobile_status_var = tk.StringVar(value=service.mobile_status_text())
         self._openclaw_configuring = False
         self._openclaw_config_result: bool | None = None
         self._openclaw_config_message = ""
@@ -1809,6 +1888,34 @@ class AiraWindow:
             side=tk.LEFT, fill=tk.BOTH, expand=True, padx=(8, 10), pady=10,
         )
         self.refresh_openclaw_status()
+
+        mobile_row = tk.Frame(
+            content, bg="#ffffff", height=72,
+            highlightthickness=1, highlightbackground=self.theme.border,
+        )
+        mobile_row.pack(fill=tk.X, pady=(12, 0))
+        mobile_row.pack_propagate(False)
+        tk.Label(
+            mobile_row, text="手机 Aira", bg="#ffffff", fg="#0f172a",
+            anchor=tk.W, font=self._font(10, "bold"),
+        ).pack(side=tk.LEFT, fill=tk.Y, padx=18)
+        self.mobile_status_label = tk.Label(
+            mobile_row, textvariable=self.mobile_status_var,
+            bg="#ffffff", fg="#64748b", anchor=tk.W, justify=tk.LEFT,
+            font=self._font(8),
+        )
+        self.mobile_button = self._button(
+            mobile_row, "启用连接", self.toggle_mobile_bridge, primary=True,
+        )
+        self.mobile_button.pack(side=tk.RIGHT, padx=(8, 18), pady=16)
+        self.mobile_reset_button = self._button(
+            mobile_row, "重置连接码", self.reset_mobile_connection_code,
+        )
+        self.mobile_reset_button.pack(side=tk.RIGHT, padx=(8, 0), pady=16)
+        self.mobile_status_label.pack(
+            side=tk.LEFT, fill=tk.BOTH, expand=True, padx=(8, 10), pady=10,
+        )
+        self.refresh_mobile_status()
 
     def save_settings(self) -> None:
         try:
@@ -2050,6 +2157,53 @@ class AiraWindow:
                 parent=self.window,
             )
 
+    def toggle_mobile_bridge(self) -> None:
+        enabled = not self.service.mobile_running
+        try:
+            if enabled:
+                self.service.start_mobile_bridge()
+            else:
+                self.service.stop_mobile_bridge()
+            self.app.settings["aira_mobile_enabled"] = enabled
+            self.save_settings()
+        except OSError as exc:
+            self.app.settings["aira_mobile_enabled"] = False
+            messagebox.showinfo(
+                "手机 Aira 连接未启动",
+                f"{exc}\n\n请确认端口 50720 未被占用，并允许 Passer 通过 Windows 防火墙。",
+                parent=self.window,
+            )
+        self.refresh_mobile_status()
+
+    def reset_mobile_connection_code(self) -> None:
+        if not messagebox.askyesno(
+            "重置手机连接码",
+            "重置后，已配置的手机需要输入新连接码才能再次连接。确定继续吗？",
+            parent=self.window,
+        ):
+            return
+        try:
+            code = self.service.reset_mobile_code()
+            self.app.write_status(f"手机 Aira 连接码已重置为 {code}。")
+        except OSError as exc:
+            messagebox.showerror("无法重置手机连接码", str(exc), parent=self.window)
+        self.refresh_mobile_status()
+
+    def refresh_mobile_status(self) -> None:
+        running = self.service.mobile_running
+        self.mobile_status_var.set(self.service.mobile_status_text())
+        self.mobile_status_label.configure(fg=self.theme.accent if running else "#64748b")
+        self.mobile_button.configure(
+            text="关闭连接" if running else "启用连接",
+            bg="#eef2f7" if running else self.theme.accent,
+            fg="#334155" if running else "#ffffff",
+        )
+        self.mobile_reset_button.configure(
+            state=tk.NORMAL if running else tk.DISABLED,
+            bg="#eef2f7",
+            fg="#334155" if running else "#94a3b8",
+        )
+
     def toggle_monitor(self) -> None:
         self.save_settings()
         enabled = not self.service.running
@@ -2078,6 +2232,7 @@ class AiraWindow:
             self.monitor_button.configure(text="开启监听", bg=self.theme.accent, fg="#ffffff")
         self.refresh_usage_status()
         self.refresh_openclaw_status()
+        self.refresh_mobile_status()
 
     @property
     def memory_dir(self) -> Path:

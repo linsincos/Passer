@@ -63,12 +63,12 @@ hiddenimports += _without_tests(collect_submodules("scipy.signal"))
 # Passer's own tool modules (imported lazily via importlib.import_module, so
 # PyInstaller cannot discover them statically — every one must be listed here).
 hiddenimports += [
-    "calculator_tool", "qr_tool", "network_tool", "screen_record_tool",
+    "calculator_tool", "qr_tool", "network_tool", "server_tool", "screen_record_tool",
     "device_lock_tool", "device_info_tool", "clicker_tool", "ai_chat",
     "random_tool", "markdown_tool", "file_search_tool",
     "magnet_tool", "map_tool", "plan_tool", "file_share_tool",
     "shutdown_tool", "mail_tool", "ai_cli_bridge", "math_render", "popup_manager",
-    "passer_module_api", "automation_tool", "aira_tool", "browser_bridge",
+    "passer_module_api", "automation_tool", "aira_tool", "aira_mobile_bridge", "browser_bridge",
     "image_ocr", "phone_mirror_interaction_tool",
 ]
 

@@ -562,6 +562,8 @@ class RelayDockApp:
         self.calculator_window = None
         self.shutdown_window = None
         self.network_window = None
+        self.server_window = None
+        self.server_service = None
         self.mail_window = None
         self.qr_window = None
         self.markdown_window = None
@@ -705,6 +707,9 @@ class RelayDockApp:
         if self.openclaw_enabled:
             # Token I/O is intentionally deferred until after the startup animation.
             self.root.after(1400, self._initialize_openclaw_bridge_runtime)
+        if bool(self.settings.get("aira_mobile_enabled", False)):
+            # LAN socket setup stays behind the startup animation just like OpenClaw.
+            self.root.after(1500, self.restore_aira_mobile_if_enabled)
         # Security restoration keeps its original early timing; it must not wait
         # behind a long tile animation when a device lock was left active.
         self.root.after(800, self.restore_device_lock_if_needed)
@@ -4152,6 +4157,7 @@ class RelayDockApp:
             BUILTIN_CALCULATOR_TARGET: self.open_calculator_tool,
             BUILTIN_SHUTDOWN_TARGET: self.open_shutdown_tool,
             BUILTIN_NETWORK_TARGET: self.open_network_tool,
+            BUILTIN_SERVER_TARGET: self.open_server_tool,
             BUILTIN_MAIL_TARGET: self.open_mail_tool,
             BUILTIN_QR_TARGET: self.open_qr_tool,
             BUILTIN_MARKDOWN_TARGET: self.open_markdown_tool,
@@ -5008,7 +5014,8 @@ class RelayDockApp:
         """遍历当前打开的工具/查看器 Toplevel 窗口。"""
         singles = (
             self.clicker_window, self.random_window, self.plan_window, self.aira_window,
-            self.calculator_window, self.shutdown_window, self.network_window, self.mail_window, self.qr_window,
+            self.calculator_window, self.shutdown_window, self.network_window, self.server_window,
+            self.mail_window, self.qr_window,
             self.markdown_window, self.file_search_window,
             self.screen_record_window, self.magnet_window, self.map_window, self.device_lock_window,
             self.device_info_window,
@@ -5231,6 +5238,36 @@ class RelayDockApp:
             self.network_window = _load_symbol("network_tool", "NetworkWindow")(self, self.network_theme())
         self.place_tool_window_on_passer(self.network_window)
         self.write_status("已打开网络检测。")
+
+    def server_theme(self) -> ClickerTheme:
+        return ClickerTheme(
+            title=BUILTIN_SERVER_TITLE,
+            border=BORDER,
+            app_bg=APP_BG,
+            surface_bg=SURFACE_BG,
+            title_bg=TITLE_BG,
+            muted_fg=MUTED_FG,
+            accent=ACCENT,
+            danger=DANGER,
+            app_font=app_font,
+            center_over_root=center_over_root,
+            place_toplevel_absolute=place_toplevel_absolute,
+        )
+
+    def ensure_server_service(self):
+        if self.server_service is None:
+            self.server_service = _load_symbol("server_tool", "ServerService")(self)
+        return self.server_service
+
+    def open_server_tool(self) -> None:
+        if self.server_window is not None and not getattr(self.server_window, "closed", True):
+            self.server_window.show()
+        else:
+            self.server_window = _load_symbol("server_tool", "ServerWindow")(
+                self, self.server_theme()
+            )
+        self.place_tool_window_on_passer(self.server_window)
+        self.write_status("已打开服务器工具。")
 
     def mail_theme(self) -> ClickerTheme:
         return ClickerTheme(
@@ -5705,12 +5742,46 @@ class RelayDockApp:
         if task is not None and not task.get("_running"):
             self._start_automation_run(task)
 
+    @staticmethod
+    def _set_automation_progress(
+        task: dict,
+        stage: str,
+        *,
+        round_number: int | None = None,
+        preview: str | None = None,
+    ) -> None:
+        """Update ephemeral automation progress exposed to paired mobile clients."""
+        task["_run_stage"] = str(stage or "正在执行")[:80]
+        task["_run_updated_at"] = datetime.now().isoformat(timespec="seconds")
+        if round_number is not None:
+            task["_run_round"] = max(0, int(round_number))
+        if preview is not None:
+            compact = str(preview).strip().replace("\x00", "")
+            task["_run_preview"] = compact[:600]
+
+    @staticmethod
+    def _clear_automation_progress(task: dict) -> None:
+        for key in (
+            "_running",
+            "_run_started_at",
+            "_run_updated_at",
+            "_run_stage",
+            "_run_round",
+            "_run_preview",
+        ):
+            task.pop(key, None)
+
     def _start_automation_run(self, task: dict) -> None:
         """启动一次任务运行：标记运行中、推进调度，再在 worker 线程里跑 AI。"""
         if self._closing or self._shutdown_event.is_set():
             return
+        started_at = datetime.now().isoformat(timespec="seconds")
         task["_running"] = True
-        task["last_run"] = datetime.now().isoformat(timespec="seconds")
+        task["_run_started_at"] = started_at
+        task["_run_round"] = 0
+        task["_run_preview"] = ""
+        self._set_automation_progress(task, "正在准备 Aira", round_number=0)
+        task["last_run"] = started_at
         # 先推进下一次时间（周期/每天）或停用（一次性），避免重复触发。
         if task.get("mode") == "once":
             task["enabled"] = False
@@ -5775,6 +5846,12 @@ class RelayDockApp:
                     final_text = "Passer 正在退出，自动化任务已停止。"
                     stopped_by_limit = False
                     break
+                round_number = _round + 1
+                self._set_automation_progress(
+                    task,
+                    f"正在请求 Aira（第 {round_number} 轮）",
+                    round_number=round_number,
+                )
                 reply, _tokens = ai_chat.call_llm(
                     provider, key, history, memory_notes, model=model,
                     reasoning=getattr(self, "ai_reasoning", "auto"),
@@ -5794,6 +5871,18 @@ class RelayDockApp:
                 action_open_re = getattr(ai_chat, "ACTION_OPEN_RE", None)
                 action_block_clipped = bool(action_open_re and action_open_re.search(raw_reply)) and not actions
                 final_text = clean or final_text
+                if actions:
+                    stage = f"正在执行电脑操作（{len(actions)} 项）"
+                elif task_state == "continue" or action_block_clipped:
+                    stage = "Aira 正在继续处理"
+                else:
+                    stage = "正在整理任务结果"
+                self._set_automation_progress(
+                    task,
+                    stage,
+                    round_number=round_number,
+                    preview=clean or final_text,
+                )
                 history.append({"role": "assistant", "content": raw_reply if action_block_clipped else clean})
                 if not actions:
                     looks_unfinished = False
@@ -5815,6 +5904,12 @@ class RelayDockApp:
                 if results:
                     rtext = "Passer 本地操作结果：\n" + "\n".join(f"- {r}" for r in results)
                     history.append({"role": "user", "content": rtext, "kind": "operation"})
+                    self._set_automation_progress(
+                        task,
+                        "电脑操作完成，等待 Aira 继续",
+                        round_number=round_number,
+                        preview="\n".join(str(result) for result in results),
+                    )
                 else:
                     stopped_by_limit = False
                     break
@@ -5828,10 +5923,10 @@ class RelayDockApp:
     def _finish_automation(self, task: dict, result: str) -> None:
         """worker 线程完成后回主线程：保存结果、通知用户、刷新窗口。"""
         if self._shutdown_event.is_set():
-            task["_running"] = False
+            self._clear_automation_progress(task)
             return
         def apply():
-            task["_running"] = False
+            self._clear_automation_progress(task)
             task["last_result"] = str(result)[:4000]
             self.save_automations()
             self._refresh_automation_window()
@@ -5894,6 +5989,15 @@ class RelayDockApp:
         if not bool(self.settings.get("aira_usage_reminder_enabled", False)):
             return
         self.ensure_aira_service().start_usage_reminder()
+
+    def restore_aira_mobile_if_enabled(self) -> None:
+        if not bool(self.settings.get("aira_mobile_enabled", False)):
+            return
+        try:
+            self.ensure_aira_service().start_mobile_bridge()
+        except OSError as exc:
+            self.settings["aira_mobile_enabled"] = False
+            self.write_status(f"手机 Aira 连接启动失败：{exc}")
 
     def open_aira_tool(self) -> None:
         service = self.ensure_aira_service()
@@ -6426,6 +6530,7 @@ class RelayDockApp:
             aira_usage_notify_mode=self.settings.get("aira_usage_notify_mode", AIRA_NOTIFY_MODE_WINDOWS),
             aira_font_size=self.aira_font_size_label,
             aira_line_spacing=self.aira_line_spacing_label,
+            aira_mobile_enabled=self.settings.get("aira_mobile_enabled", False),
         )
         self._recent_search_dirty = False
 
@@ -6801,7 +6906,8 @@ class RelayDockApp:
             return None
         names = (
             "clicker_window", "random_window", "plan_window", "aira_window",
-            "calculator_window", "shutdown_window", "network_window", "mail_window", "qr_window", "markdown_window",
+            "calculator_window", "shutdown_window", "network_window", "server_window",
+            "mail_window", "qr_window", "markdown_window",
             "file_search_window", "screen_record_window", "magnet_window", "map_window",
             "device_lock_window", "device_info_window",
         )
@@ -6996,6 +7102,16 @@ class RelayDockApp:
                 pass
             self.file_share_service = None
 
+        self._close_controller(getattr(self, "server_window", None))
+        self.server_window = None
+        server_service = getattr(self, "server_service", None)
+        if server_service is not None:
+            try:
+                server_service.close()
+            except Exception:
+                pass
+            self.server_service = None
+
         self._stop_phone_mirror()
         self._close_controller(self.aira_service)
         self.aira_service = None
@@ -7026,7 +7142,7 @@ class RelayDockApp:
 
         tool_attrs = (
             "clicker_window", "random_window", "plan_window", "automation_window",
-            "calculator_window", "shutdown_window", "network_window", "mail_window",
+            "calculator_window", "shutdown_window", "network_window", "server_window", "mail_window",
             "qr_window", "markdown_window", "file_search_window", "screen_record_window",
             "magnet_window", "map_window", "device_info_window", "aira_window",
             "device_lock_window",
@@ -7272,18 +7388,26 @@ class RelayDockApp:
             target=worker, daemon=True, name="Passer-OpenClawConfig"
         ).start()
 
-    def _dispatch_openclaw_request(self, action: str, params: dict) -> dict:
-        """Run one non-destructive, explicitly allowlisted OpenClaw action on the UI thread."""
-        if not self.openclaw_enabled:
-            raise PermissionError("Passer 设置中的“启用 OpenClaw”当前已关闭。")
+    def _dispatch_control_request(
+        self,
+        action: str,
+        params: dict,
+        *,
+        allowed_actions,
+        source_name: str,
+    ) -> dict:
+        """Run one allowlisted remote-control action on Tk's UI thread."""
         action = str(action or "").strip().casefold()
-        if action not in OPENCLAW_CONTROL_ACTIONS:
-            raise PermissionError(f"OpenClaw 不允许调用 Passer 动作：{action or '（空）'}")
+        allowed = tuple(str(value) for value in allowed_actions)
+        if action not in allowed:
+            raise PermissionError(
+                f"{source_name} 不允许调用 Passer 动作：{action or '（空）'}"
+            )
         clean: dict[str, str] = {}
         for key in ("query", "tool", "target"):
             value = str((params or {}).get(key) or "").strip()
             if len(value) > 4096:
-                raise ValueError(f"OpenClaw 参数 {key} 过长。")
+                raise ValueError(f"{source_name} 参数 {key} 过长。")
             if value:
                 clean[key] = value
         if action == "status":
@@ -7291,17 +7415,164 @@ class RelayDockApp:
                 visible = bool(self.root.winfo_viewable())
             except tk.TclError:
                 visible = False
-            return {
+            status = {
                 "action": action,
                 "running": True,
                 "window_visible": visible,
                 "items": len(self.items),
                 "aira_enabled": bool(self.ai_enabled_var.get()),
-                "allowed_actions": list(OPENCLAW_CONTROL_ACTIONS),
+                "allowed_actions": list(allowed),
             }
+            mobile_bridge = getattr(
+                getattr(self, "aira_service", None),
+                "mobile_bridge",
+                None,
+            )
+            if source_name == "手机 Aira" and mobile_bridge is not None:
+                identity = mobile_bridge.snapshot()
+                status["computer_id"] = str(identity.get("computer_id") or "")
+                status["computer_name"] = str(identity.get("computer_name") or "Passer")
+            return status
         if action == "summon":
             self.summon_window()
             return {"action": action, "messages": ["Passer 窗口已唤起。"]}
+        if action == "list_tasks":
+            describe = _load_symbol("automation_tool", "describe_schedule")
+            tasks = []
+            all_tasks = list(getattr(self, "automations", []))
+            visible_tasks = sorted(
+                all_tasks,
+                key=lambda item: not bool(item.get("_running")),
+            )[:20]
+            for task in visible_tasks:
+                running = bool(task.get("_running"))
+                try:
+                    run_round = (
+                        max(0, int(task.get("_run_round") or 0))
+                        if running else 0
+                    )
+                except (TypeError, ValueError):
+                    run_round = 0
+                tasks.append({
+                    "id": str(task.get("id") or ""),
+                    "title": str(task.get("title") or "未命名任务")[:80],
+                    "prompt": str(task.get("prompt") or "")[:240],
+                    "mode": str(task.get("mode") or ""),
+                    "schedule": str(describe(task)),
+                    "enabled": bool(task.get("enabled", True)),
+                    "next_run": str(task.get("next_run") or ""),
+                    "last_run": str(task.get("last_run") or ""),
+                    "last_result": str(task.get("last_result") or "")[:360],
+                    "running": running,
+                    "run_started_at": (
+                        str(task.get("_run_started_at") or task.get("last_run") or "")
+                        if running else ""
+                    ),
+                    "run_updated_at": (
+                        str(task.get("_run_updated_at") or "") if running else ""
+                    ),
+                    "run_stage": (
+                        str(task.get("_run_stage") or "正在执行")[:80]
+                        if running else ""
+                    ),
+                    "run_round": run_round,
+                    "run_preview": (
+                        str(task.get("_run_preview") or "")[:360]
+                        if running else ""
+                    ),
+                })
+            active_count = sum(
+                1 for task in all_tasks if bool(task.get("_running"))
+            )
+            return {
+                "action": action,
+                "tasks": tasks,
+                "count": len(all_tasks),
+                "truncated": len(all_tasks) > len(tasks),
+                "active_count": active_count,
+                "server_time": datetime.now().isoformat(timespec="seconds"),
+                "refresh_after_ms": 2500 if active_count else 10000,
+            }
+        if action == "add_task":
+            if len(getattr(self, "automations", [])) >= 200:
+                raise ValueError("自动化任务已达到 200 条上限。")
+            raw = dict(params or {})
+            title = str(raw.get("title") or "").strip()[:80]
+            prompt = str(raw.get("prompt") or raw.get("instruction") or "").strip()
+            if not title:
+                raise ValueError("add_task 需要 title。")
+            if not prompt:
+                raise ValueError("add_task 需要 prompt。")
+            if len(prompt) > 12_000:
+                raise ValueError("任务指令不能超过 12000 个字符。")
+            mode_lookup = {
+                "once": "once", "一次": "once",
+                "daily": "daily", "每天": "daily",
+                "interval": "interval", "间隔": "interval",
+            }
+            mode = mode_lookup.get(
+                str(raw.get("mode") or "daily").strip().casefold(),
+                "",
+            )
+            if not mode:
+                raise ValueError("mode 可选 once、daily、interval。")
+            unit_lookup = {
+                "minutes": "minutes", "minute": "minutes", "分钟": "minutes",
+                "hours": "hours", "hour": "hours", "小时": "hours",
+                "days": "days", "day": "days", "天": "days",
+            }
+            unit = unit_lookup.get(
+                str(raw.get("unit") or "hours").strip().casefold(),
+                "",
+            )
+            if not unit:
+                raise ValueError("unit 可选 minutes、hours、days。")
+            try:
+                every = int(raw.get("every") or 1)
+            except (TypeError, ValueError) as exc:
+                raise ValueError("every 必须是数字。") from exc
+            if not 1 <= every <= 100_000:
+                raise ValueError("every 必须在 1–100000 之间。")
+            at = str(raw.get("at") or "09:00").strip()
+            if mode == "daily":
+                pieces = at.replace("：", ":").split(":")
+                try:
+                    valid_at = (
+                        len(pieces) == 2
+                        and 0 <= int(pieces[0]) <= 23
+                        and 0 <= int(pieces[1]) <= 59
+                    )
+                except ValueError:
+                    valid_at = False
+                if not valid_at:
+                    raise ValueError("每天任务的 at 必须是 HH:MM，例如 09:00。")
+            task = _load_symbol("automation_tool", "new_task")(
+                title=title,
+                prompt=prompt,
+                mode=mode,
+                every=every,
+                unit=unit,
+                at=at,
+                when=str(raw.get("when") or "").strip(),
+                enabled=True,
+            )
+            if mode == "once" and not task.get("next_run"):
+                raise ValueError("一次性任务时间无效或已经过去。")
+            self.automations.append(task)
+            self.save_automations()
+            self._refresh_automation_window()
+            describe = _load_symbol("automation_tool", "describe_schedule")
+            return {
+                "action": action,
+                "task": {
+                    "id": task["id"],
+                    "title": task["title"],
+                    "schedule": describe(task),
+                    "enabled": bool(task.get("enabled", True)),
+                    "next_run": str(task.get("next_run") or ""),
+                },
+                "messages": [f"已添加任务：{task['title']} · {describe(task)}"],
+            }
 
         spec: dict[str, object] = {"action": action}
         if action in {"list_items", "search", "select_item", "locate_item", "open_item"}:
@@ -7322,6 +7593,31 @@ class RelayDockApp:
             spec["target"] = target
         messages = [str(value) for value in self.execute_ai_actions([spec])]
         return {"action": action, "messages": messages}
+
+    def _dispatch_openclaw_request(self, action: str, params: dict) -> dict:
+        """Run one non-destructive, explicitly allowlisted OpenClaw action."""
+        if not self.openclaw_enabled:
+            raise PermissionError("Passer 设置中的“启用 OpenClaw”当前已关闭。")
+        return self._dispatch_control_request(
+            action,
+            params,
+            allowed_actions=OPENCLAW_CONTROL_ACTIONS,
+            source_name="OpenClaw",
+        )
+
+    def _dispatch_aira_mobile_request(self, action: str, params: dict) -> dict:
+        """Run an authenticated Aira Mobile action with its narrower allowlist."""
+        if not bool(self.settings.get("aira_mobile_enabled", False)):
+            raise PermissionError("Aira 中的“手机连接”当前已关闭。")
+        allowed_actions = _load_symbol(
+            "aira_mobile_bridge", "PHONE_CONTROL_ACTIONS"
+        )
+        return self._dispatch_control_request(
+            action,
+            params,
+            allowed_actions=allowed_actions,
+            source_name="手机 Aira",
+        )
 
     @staticmethod
     def _receive_instance_message(conn: socket.socket, limit: int = 64 * 1024) -> bytes:
@@ -13779,6 +14075,16 @@ def _signal_existing_instance() -> bool:
 
 
 def main() -> int:
+    if os.environ.get("PASSER_SSH_ASKPASS") == "1" or "--server-ssh-askpass" in sys.argv:
+        prompt = next(
+            (
+                arg
+                for arg in sys.argv[1:]
+                if arg != "--server-ssh-askpass"
+            ),
+            "",
+        )
+        return _load_symbol("server_tool", "run_ssh_askpass")(prompt)
     if "--smoke-test" in sys.argv:
         return smoke_test()
     is_primary, instance_server, instance_mutex = _become_single_instance()

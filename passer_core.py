@@ -927,6 +927,7 @@ BUILTIN_AIRA_TARGET = "passer://aira"
 BUILTIN_CALCULATOR_TARGET = "passer://calculator"
 BUILTIN_SHUTDOWN_TARGET = "passer://shutdown"
 BUILTIN_NETWORK_TARGET = "passer://network"
+BUILTIN_SERVER_TARGET = "passer://server"
 BUILTIN_MAIL_TARGET = "passer://mail"
 BUILTIN_QR_TARGET = "passer://qr"
 BUILTIN_MARKDOWN_TARGET = "passer://markdown"
@@ -953,6 +954,7 @@ BUILTIN_AIRA_TITLE = "Aira"
 BUILTIN_CALCULATOR_TITLE = "计算器 Calculator"
 BUILTIN_SHUTDOWN_TITLE = "定时关机 Shutdown"
 BUILTIN_NETWORK_TITLE = "网络检测 Network"
+BUILTIN_SERVER_TITLE = "服务器 Server"
 BUILTIN_MAIL_TITLE = "邮件 Mail"
 BUILTIN_QR_TITLE = "二维码 QR"
 BUILTIN_MARKDOWN_TITLE = "Markdown 预览器"
@@ -1021,6 +1023,16 @@ BUILTIN_TOOLS = (
         "title": BUILTIN_NETWORK_TITLE,
         "detail": "内置工具",
         "aliases": ("网络检测", "网络", "测速", "下载测速", "ping", "延迟", "network", "speed test", "speedtest"),
+    },
+    {
+        "id": "__passer_builtin_server__",
+        "target": BUILTIN_SERVER_TARGET,
+        "title": BUILTIN_SERVER_TITLE,
+        "detail": "内置工具",
+        "aliases": (
+            "服务器", "本地服务器", "静态服务器", "HTTP服务器", "网关",
+            "server", "web server", "http server", "localhost", "gateway",
+        ),
     },
     {
         "id": "__passer_builtin_mail__",
@@ -1161,6 +1173,7 @@ BUILTIN_TOOL_ICON_STYLE = {
     BUILTIN_CALCULATOR_TARGET: ("calculator", "#0f766e"),
     BUILTIN_SHUTDOWN_TARGET: ("power", "#dc2626"),
     BUILTIN_NETWORK_TARGET: ("network", "#0284c7"),
+    BUILTIN_SERVER_TARGET: ("network", "#0f766e"),
     BUILTIN_MAIL_TARGET: ("mail", "#2563eb"),
     BUILTIN_QR_TARGET: ("qr", "#7c2d12"),
     BUILTIN_MARKDOWN_TARGET: ("document", "#334155"),
@@ -2338,12 +2351,25 @@ def load_automations() -> list[dict]:
     if isinstance(raw, list):
         for entry in raw:
             if isinstance(entry, dict) and entry.get("id") and entry.get("prompt"):
-                tasks.append(entry)
+                tasks.append({
+                    key: value
+                    for key, value in entry.items()
+                    if not str(key).startswith("_")
+                })
     return tasks
 
 
 def save_automations(tasks: list[dict]) -> None:
-    write_json(AUTOMATIONS_FILE, [t for t in tasks if isinstance(t, dict)])
+    persistent = []
+    for task in tasks:
+        if not isinstance(task, dict):
+            continue
+        persistent.append({
+            key: value
+            for key, value in task.items()
+            if not str(key).startswith("_")
+        })
+    write_json(AUTOMATIONS_FILE, persistent)
 
 
 def write_json(path: Path, value) -> None:
@@ -2701,6 +2727,7 @@ def load_settings() -> dict:
         "aira_usage_notify_mode": normalize_aira_notify_mode(
             settings.get("aira_usage_notify_mode")
         ),
+        "aira_mobile_enabled": bool(settings.get("aira_mobile_enabled", False)),
     }
 
 
@@ -2762,6 +2789,7 @@ def save_settings(
     aira_usage_notify_mode: str = AIRA_NOTIFY_MODE_WINDOWS,
     aira_font_size: str = DEFAULT_FONT_SIZE_LABEL,
     aira_line_spacing: str = DEFAULT_AIRA_LINE_SPACING_LABEL,
+    aira_mobile_enabled: bool = False,
 ) -> None:
     clear_share_code = str(file_share_code or "").strip()
     protected_share_code = protect_password(clear_share_code) if clear_share_code else ""
@@ -2837,6 +2865,7 @@ def save_settings(
             "aira_save_raw": bool(aira_save_raw),
             "aira_usage_reminder_enabled": bool(aira_usage_reminder_enabled),
             "aira_usage_notify_mode": normalize_aira_notify_mode(aira_usage_notify_mode),
+            "aira_mobile_enabled": bool(aira_mobile_enabled),
         },
     )
 
