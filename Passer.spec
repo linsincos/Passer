@@ -1,9 +1,15 @@
 # -*- mode: python ; coding: utf-8 -*-
-"""PyInstaller spec for Passer.
+"""PyInstaller spec for Passer's fast, cleanup-safe Windows bundle.
 
 Build with:   pyinstaller Passer.spec --noconfirm
 
-Produces a single-file  dist/Passer.exe  with all optional features bundled:
+Produces ``dist/Passer.exe`` plus its ``dist/PasserRuntime`` folder.
+Keeping support files beside the executable avoids one-file's per-launch _MEI
+extraction, which both shortens startup and removes temporary-directory cleanup
+failures.  The flat collection name keeps the public executable path compatible
+with existing shortcuts and OpenClaw registrations.
+
+All optional features remain bundled:
   * QR generate + recognise (pyzbar + its libzbar/libiconv DLLs)
   * per-program mute        (pycaw + comtypes)
   * scientific calculator   (sympy + mpmath)
@@ -11,8 +17,19 @@ Produces a single-file  dist/Passer.exe  with all optional features bundled:
   * PDF/image previews      (Pillow, pypdfium2)
 """
 
+import re as _re
+
+import PyInstaller as _PyInstaller
 from PyInstaller.utils.hooks import collect_dynamic_libs, collect_data_files, collect_submodules
 import os as _os
+
+_pyinstaller_version = tuple(
+    int(part) for part in _re.findall(r"\d+", _PyInstaller.__version__)[:3]
+)
+if _pyinstaller_version < (6, 21):
+    raise SystemExit(
+        "Passer's supported Windows bundle requires PyInstaller >= 6.21."
+    )
 
 block_cipher = None
 
@@ -43,6 +60,9 @@ hiddenimports += ["tkinterdnd2"]
 # pycaw + comtypes define the Core Audio COM interfaces used for muting
 hiddenimports += _without_tests(collect_submodules("pycaw"))
 hiddenimports += _without_tests(collect_submodules("comtypes"))
+
+# 手机 Aira v2 bridge uses cryptography for ephemeral ECDH and AES-GCM.
+hiddenimports += _without_tests(collect_submodules("cryptography"))
 
 # sympy / mpmath power the calculator's symbolic engine (diff / integrate / solve)
 hiddenimports += ["sympy", "mpmath"]
@@ -183,17 +203,15 @@ pyz = PYZ(a.pure, a.zipped_data, cipher=block_cipher)
 exe = EXE(
     pyz,
     a.scripts,
-    a.binaries,
-    a.zipfiles,
-    a.datas,
     [],
+    exclude_binaries=True,
     name="Passer",
     debug=False,
     bootloader_ignore_signals=False,
     strip=False,
-    upx=True,
+    upx=False,
     upx_exclude=[],
-    runtime_tmpdir=None,
+    contents_directory="PasserRuntime",
     # Keep redirected stdio available for `Passer.exe --openclaw-mcp`, while
     # hiding the owned console before Python starts during normal GUI launch.
     console=True,
@@ -203,6 +221,16 @@ exe = EXE(
     codesign_identity=None,
     entitlements_file=None,
     icon="passer.ico",
+)
+
+coll = COLLECT(
+    exe,
+    a.binaries,
+    a.datas,
+    strip=False,
+    upx=False,
+    upx_exclude=[],
+    name=".",
 )
 
 

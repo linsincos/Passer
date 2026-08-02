@@ -650,6 +650,39 @@ def _no_window_flag() -> int:
     return subprocess.CREATE_NO_WINDOW if hasattr(subprocess, "CREATE_NO_WINDOW") else 0
 
 
+_EXTERNAL_LAUNCH_LOCK = threading.RLock()
+
+
+def _set_windows_dll_directory(path: str | None) -> bool:
+    if sys.platform != "win32":
+        return False
+    try:
+        kernel32 = ctypes.windll.kernel32
+        kernel32.SetDllDirectoryW.argtypes = [wintypes.LPCWSTR]
+        kernel32.SetDllDirectoryW.restype = wintypes.BOOL
+        return bool(kernel32.SetDllDirectoryW(path))
+    except (AttributeError, OSError):
+        return False
+
+
+@contextlib.contextmanager
+def _external_program_launch_environment():
+    """Prevent frozen-only DLLs from leaking into independently installed apps."""
+    bundle_dir = str(getattr(sys, "_MEIPASS", "") or "")
+    should_reset = bool(
+        sys.platform == "win32"
+        and getattr(sys, "frozen", False)
+        and bundle_dir
+    )
+    with _EXTERNAL_LAUNCH_LOCK:
+        reset = _set_windows_dll_directory(None) if should_reset else False
+        try:
+            yield
+        finally:
+            if reset:
+                _set_windows_dll_directory(bundle_dir)
+
+
 def notify_windows(title: str, message: str) -> None:
     """Show a Windows toast in the notification centre (通知栏).
 
@@ -694,27 +727,38 @@ def launch_executable(path: Path) -> None:
     so the new window isn't stuck behind Passer's always-on-top dock.
     """
     parent = str(path.parent)
-    if sys.platform == "win32":
-        allow_any_foreground()
-        try:
-            shell32 = ctypes.windll.shell32
-            shell32.ShellExecuteW.argtypes = [
-                wintypes.HWND, wintypes.LPCWSTR, wintypes.LPCWSTR,
-                wintypes.LPCWSTR, wintypes.LPCWSTR, ctypes.c_int,
-            ]
-            shell32.ShellExecuteW.restype = ctypes.c_ssize_t
-            SW_SHOWNORMAL = 1
-            result = shell32.ShellExecuteW(None, "open", str(path), None, parent, SW_SHOWNORMAL)
-            if result > 32:
+    with _external_program_launch_environment():
+        if sys.platform == "win32":
+            allow_any_foreground()
+            # Starting the executable directly avoids Explorer/DDE brokers that
+            # can leave some Electron apps running without ever creating their
+            # main window.  The app still receives its own folder as cwd.
+            try:
+                subprocess.Popen(
+                    [str(path)],
+                    cwd=parent,
+                    close_fds=True,
+                    creationflags=_no_window_flag(),
+                )
                 return
-        except Exception:
-            pass
-        try:
-            subprocess.Popen([str(path)], cwd=parent, close_fds=True, creationflags=_no_window_flag())
-            return
-        except Exception:
-            pass
-    os.startfile(str(path))  # type: ignore[attr-defined]
+            except OSError:
+                pass
+            try:
+                shell32 = ctypes.windll.shell32
+                shell32.ShellExecuteW.argtypes = [
+                    wintypes.HWND, wintypes.LPCWSTR, wintypes.LPCWSTR,
+                    wintypes.LPCWSTR, wintypes.LPCWSTR, ctypes.c_int,
+                ]
+                shell32.ShellExecuteW.restype = ctypes.c_ssize_t
+                SW_SHOWNORMAL = 1
+                result = shell32.ShellExecuteW(
+                    None, "open", str(path), None, parent, SW_SHOWNORMAL,
+                )
+                if result > 32:
+                    return
+            except (AttributeError, OSError):
+                pass
+        os.startfile(str(path))  # type: ignore[attr-defined]
 
 
 def allow_any_foreground() -> None:
@@ -1089,21 +1133,94 @@ def shell_open(path: Path) -> None:
     rights, so a running single-instance app focuses its window instead of
     appearing to do nothing.
     """
-    if sys.platform == "win32":
-        try:
-            shell32 = ctypes.windll.shell32
-            shell32.ShellExecuteW.restype = ctypes.c_ssize_t
-            SW_SHOWNORMAL = 1
-            result = shell32.ShellExecuteW(None, "open", str(path), None, None, SW_SHOWNORMAL)
-            if result > 32:
-                return
-        except Exception:
-            pass
-    os.startfile(str(path))  # type: ignore[attr-defined]
+    with _external_program_launch_environment():
+        if sys.platform == "win32":
+            try:
+                shell32 = ctypes.windll.shell32
+                shell32.ShellExecuteW.restype = ctypes.c_ssize_t
+                SW_SHOWNORMAL = 1
+                result = shell32.ShellExecuteW(
+                    None, "open", str(path), None, None, SW_SHOWNORMAL,
+                )
+                if result > 32:
+                    return
+            except (AttributeError, OSError):
+                pass
+        os.startfile(str(path))  # type: ignore[attr-defined]
 
 
 def is_windowsapps_path(path: Path) -> bool:
     return any(part.lower() == "windowsapps" for part in path.parts)
+
+
+def _with_windows_shell_item(parsing_name: str, operation=None) -> bool:
+    """Parse one filesystem/shell item and optionally operate on its PIDL."""
+    if sys.platform != "win32":
+        return False
+    pidl = ctypes.c_void_p()
+    initialized_here = False
+    try:
+        ole32 = ctypes.windll.ole32
+        shell32 = ctypes.windll.shell32
+        ole32.CoInitializeEx.argtypes = [ctypes.c_void_p, wintypes.DWORD]
+        ole32.CoInitializeEx.restype = ctypes.c_long
+        init_result = int(ole32.CoInitializeEx(None, 0x2))
+        initialized_here = init_result in (0, 1)
+        # RPC_E_CHANGED_MODE means this thread is already initialized using a
+        # different apartment model; shell parsing is still available.
+        if init_result not in (0, 1, -2147417850):
+            return False
+
+        shell32.SHParseDisplayName.argtypes = [
+            wintypes.LPCWSTR,
+            ctypes.c_void_p,
+            ctypes.POINTER(ctypes.c_void_p),
+            wintypes.DWORD,
+            ctypes.POINTER(wintypes.DWORD),
+        ]
+        shell32.SHParseDisplayName.restype = ctypes.c_long
+        attributes = wintypes.DWORD()
+        result = int(shell32.SHParseDisplayName(
+            str(parsing_name),
+            None,
+            ctypes.byref(pidl),
+            0,
+            ctypes.byref(attributes),
+        ))
+        if result != 0 or not pidl.value:
+            return False
+        return True if operation is None else bool(operation(shell32, pidl))
+    except (AttributeError, OSError, ValueError):
+        return False
+    finally:
+        if pidl.value:
+            try:
+                ctypes.windll.ole32.CoTaskMemFree(pidl)
+            except (AttributeError, OSError):
+                pass
+        if initialized_here:
+            try:
+                ctypes.windll.ole32.CoUninitialize()
+            except (AttributeError, OSError):
+                pass
+
+
+def windows_shell_item_exists(parsing_name: str) -> bool:
+    return _with_windows_shell_item(parsing_name)
+
+
+def select_windows_shell_item(parsing_name: str) -> bool:
+    def select(shell32, pidl) -> bool:
+        shell32.SHOpenFolderAndSelectItems.argtypes = [
+            ctypes.c_void_p,
+            wintypes.UINT,
+            ctypes.c_void_p,
+            wintypes.DWORD,
+        ]
+        shell32.SHOpenFolderAndSelectItems.restype = ctypes.c_long
+        return int(shell32.SHOpenFolderAndSelectItems(pidl, 0, None, 0)) == 0
+
+    return _with_windows_shell_item(parsing_name, select)
 
 
 def windowsapps_family_name(path: Path) -> str | None:
@@ -1123,12 +1240,221 @@ def windowsapps_family_name(path: Path) -> str | None:
     return f"{name}_{publisher}"
 
 
+WINDOWSAPPS_INSTALL_PATH_CACHE: dict[str, tuple[Path, ...]] = {}
+WINDOWSAPPS_CURRENT_TARGET_CACHE: dict[str, Path | None] = {}
+WINDOWS_STATE_REPOSITORY_CACHE_ROOT = (
+    r"SOFTWARE\Microsoft\Windows\CurrentVersion\AppModel"
+    r"\StateRepository\Cache"
+)
+
+
+def _registry_subkey_names(winreg, root, path: str) -> tuple[str, ...]:
+    """Enumerate one StateRepository index level without recursively scanning it."""
+    access = winreg.KEY_READ | getattr(winreg, "KEY_WOW64_64KEY", 0)
+    try:
+        with winreg.OpenKey(root, path, 0, access) as key:
+            names: list[str] = []
+            index = 0
+            while True:
+                try:
+                    names.append(winreg.EnumKey(key, index))
+                except OSError:
+                    break
+                index += 1
+            return tuple(names)
+    except OSError:
+        return ()
+
+
+def state_repository_app_user_model_ids(family_name: str) -> tuple[str, ...]:
+    """Read authoritative AUMIDs for a package family from Windows' indexed state."""
+    family_name = str(family_name or "").strip()
+    if (
+        sys.platform != "win32"
+        or not family_name
+        or "\\" in family_name
+        or "/" in family_name
+    ):
+        return ()
+    try:
+        import winreg
+    except ImportError:
+        return ()
+
+    base = WINDOWS_STATE_REPOSITORY_CACHE_ROOT
+    family_index = (
+        rf"{base}\PackageFamily\Index\PackageFamilyName\{family_name}"
+    )
+    family_records = _registry_subkey_names(
+        winreg, winreg.HKEY_LOCAL_MACHINE, family_index
+    )
+    aumids: list[str] = []
+    access = winreg.KEY_READ | getattr(winreg, "KEY_WOW64_64KEY", 0)
+    expected_prefix = (family_name + "!").casefold()
+    for family_record in family_records:
+        package_index = rf"{base}\Package\Index\PackageFamily\{family_record}"
+        for package_record in _registry_subkey_names(
+            winreg, winreg.HKEY_LOCAL_MACHINE, package_index
+        ):
+            application_index = (
+                rf"{base}\Application\Index\Package\{package_record}"
+            )
+            for application_record in _registry_subkey_names(
+                winreg, winreg.HKEY_LOCAL_MACHINE, application_index
+            ):
+                application_data = (
+                    rf"{base}\Application\Data\{application_record}"
+                )
+                try:
+                    with winreg.OpenKey(
+                        winreg.HKEY_LOCAL_MACHINE,
+                        application_data,
+                        0,
+                        access,
+                    ) as key:
+                        value, _value_type = winreg.QueryValueEx(
+                            key, "ApplicationUserModelId"
+                        )
+                except OSError:
+                    continue
+                aumid = str(value or "").strip()
+                if aumid.casefold().startswith(expected_prefix):
+                    aumids.append(aumid)
+    return tuple(dict.fromkeys(aumids))
+
+
+def windowsapps_install_paths(family_name: str) -> tuple[Path, ...]:
+    """Return current install roots for a package family without listing WindowsApps."""
+    if family_name in WINDOWSAPPS_INSTALL_PATH_CACHE:
+        return WINDOWSAPPS_INSTALL_PATH_CACHE[family_name]
+    roots: list[Path] = []
+    if sys.platform == "win32":
+        try:
+            kernel32 = ctypes.windll.kernel32
+            uint32_pointer = ctypes.POINTER(ctypes.c_uint32)
+            kernel32.GetPackagesByPackageFamily.argtypes = [
+                wintypes.LPCWSTR,
+                uint32_pointer,
+                ctypes.POINTER(ctypes.c_wchar_p),
+                uint32_pointer,
+                wintypes.LPWSTR,
+            ]
+            kernel32.GetPackagesByPackageFamily.restype = wintypes.LONG
+            kernel32.GetPackagePathByFullName.argtypes = [
+                wintypes.LPCWSTR,
+                uint32_pointer,
+                wintypes.LPWSTR,
+            ]
+            kernel32.GetPackagePathByFullName.restype = wintypes.LONG
+
+            count = ctypes.c_uint32()
+            names_length = ctypes.c_uint32()
+            insufficient_buffer = 122
+            result = int(kernel32.GetPackagesByPackageFamily(
+                family_name,
+                ctypes.byref(count),
+                None,
+                ctypes.byref(names_length),
+                None,
+            ))
+            if result == insufficient_buffer and count.value and names_length.value:
+                names = (ctypes.c_wchar_p * count.value)()
+                names_buffer = ctypes.create_unicode_buffer(names_length.value)
+                result = int(kernel32.GetPackagesByPackageFamily(
+                    family_name,
+                    ctypes.byref(count),
+                    names,
+                    ctypes.byref(names_length),
+                    names_buffer,
+                ))
+                if result == 0:
+                    for package_full_name in names[:count.value]:
+                        path_length = ctypes.c_uint32()
+                        path_result = int(kernel32.GetPackagePathByFullName(
+                            package_full_name,
+                            ctypes.byref(path_length),
+                            None,
+                        ))
+                        if path_result != insufficient_buffer or not path_length.value:
+                            continue
+                        path_buffer = ctypes.create_unicode_buffer(path_length.value)
+                        path_result = int(kernel32.GetPackagePathByFullName(
+                            package_full_name,
+                            ctypes.byref(path_length),
+                            path_buffer,
+                        ))
+                        if path_result == 0 and path_buffer.value:
+                            roots.append(Path(path_buffer.value))
+        except (AttributeError, OSError, TypeError, ValueError):
+            pass
+        # Full-trust packages can be installed and running without appearing in
+        # GetPackagesByPackageFamily for the current token.  A running process
+        # still exposes the authoritative, current versioned package root.
+        try:
+            process_paths = [
+                Path(str(process.get("path") or ""))
+                for process in running_processes_detailed()
+                if process.get("path")
+            ]
+        except (NameError, OSError, TypeError, ValueError):
+            process_paths = []
+        environment_paths = [
+            Path(value)
+            for value in str(os.environ.get("PATH") or "").split(os.pathsep)
+            if value
+        ]
+        for candidate in process_paths + environment_paths:
+            if windowsapps_family_name(candidate) != family_name:
+                continue
+            for index, part in enumerate(candidate.parts):
+                if part.casefold() == "windowsapps" and index + 1 < len(candidate.parts):
+                    roots.append(Path(*candidate.parts[:index + 2]))
+                    break
+    result = tuple(dict.fromkeys(roots))
+    WINDOWSAPPS_INSTALL_PATH_CACHE[family_name] = result
+    return result
+
+
+def resolve_current_windowsapps_target(path: Path) -> Path | None:
+    """Repair a versioned WindowsApps executable path after a Store update."""
+    cache_key = str(path).casefold()
+    if cache_key in WINDOWSAPPS_CURRENT_TARGET_CACHE:
+        return WINDOWSAPPS_CURRENT_TARGET_CACHE[cache_key]
+    family = windowsapps_family_name(path)
+    parts = path.parts
+    relative_parts: tuple[str, ...] = ()
+    for index, part in enumerate(parts):
+        if part.casefold() == "windowsapps" and index + 2 < len(parts):
+            relative_parts = tuple(parts[index + 2:])
+            break
+    resolved = None
+    if family and relative_parts:
+        for root in windowsapps_install_paths(family):
+            candidate = root.joinpath(*relative_parts)
+            try:
+                if candidate.is_file():
+                    resolved = candidate
+                    break
+            except OSError:
+                continue
+    WINDOWSAPPS_CURRENT_TARGET_CACHE[cache_key] = resolved
+    return resolved
+
+
 def resolve_app_user_model_id(family_name: str) -> str | None:
     """Look up the launchable AUMID (e.g. ``Claude_xxx!Claude``) for a package family."""
     if sys.platform != "win32":
         return None
     if family_name in WINDOWSAPPS_AUMID_CACHE:
         return WINDOWSAPPS_AUMID_CACHE[family_name]
+    # Full-trust Store apps such as Codex may be absent from Get-StartApps and
+    # may reject direct execution from their protected WindowsApps directory.
+    # StateRepository is the authoritative, indexed source for their AUMID and
+    # avoids starting PowerShell on the common path.
+    state_aumids = state_repository_app_user_model_ids(family_name)
+    if state_aumids:
+        WINDOWSAPPS_AUMID_CACHE[family_name] = state_aumids[0]
+        return state_aumids[0]
     pattern = (family_name + "!*").replace("'", "''")
     command = (
         "[Console]::OutputEncoding=[Text.UTF8Encoding]::UTF8; "
@@ -1144,6 +1470,17 @@ def resolve_app_user_model_id(family_name: str) -> str | None:
     except Exception:
         return None
     aumid = result.stdout.strip()
+    if not aumid:
+        # Get-StartApps omits some full-trust Store apps.  Their common
+        # application id is "App"; validate the resulting shell item before
+        # accepting it so an uninstalled package never opens Explorer's default
+        # Documents page.
+        common_ids = ("App", family_name.split("_", 1)[0].rsplit(".", 1)[-1])
+        for application_id in dict.fromkeys(common_ids):
+            candidate = f"{family_name}!{application_id}"
+            if windows_shell_item_exists(f"shell:AppsFolder\\{candidate}"):
+                aumid = candidate
+                break
     WINDOWSAPPS_AUMID_CACHE[family_name] = aumid or None
     return WINDOWSAPPS_AUMID_CACHE[family_name]
 
@@ -1422,8 +1759,15 @@ def open_target(item: DockItem) -> None:
     if sys.platform == "win32":
         # Packaged WindowsApps apps (e.g. Claude, Codex) can't be stat'd or launched by
         # full path; route them through their AppsFolder AUMID instead.
-        if is_windowsapps_path(path) and launch_packaged_app(path):
-            return
+        if is_windowsapps_path(path):
+            if launch_packaged_app(path):
+                return
+            # Keep direct execution only as a compatibility fallback for unusual
+            # packages with no registered application identity.
+            current_target = resolve_current_windowsapps_target(path)
+            if current_target is not None:
+                launch_executable(current_target)
+                return
         if not path.exists():
             raise FileNotFoundError(item.target)
         # Grant foreground rights so an already-running single-instance app (e.g.
@@ -1445,13 +1789,37 @@ def reveal_target(item: DockItem) -> None:
     if item.kind == "url":
         return
     path = Path(item.target)
+    if sys.platform == "win32" and is_windowsapps_path(path):
+        current_target = resolve_current_windowsapps_target(path)
+        if current_target is not None:
+            if select_windows_shell_item(str(current_target.resolve())):
+                return
+            subprocess.Popen(
+                ["explorer.exe", f"/select,{current_target.resolve()}"],
+                creationflags=_no_window_flag(),
+            )
+            return
+        aumid = windowsapps_aumid_for_path(path)
+        if not aumid:
+            raise FileNotFoundError(item.target)
+        shell_item = f"shell:AppsFolder\\{aumid}"
+        if select_windows_shell_item(shell_item):
+            return
+        # Never pass an invalid or stale package path to explorer /select; that
+        # silently falls back to the Documents page.  AppsFolder is the correct
+        # visible fallback for an installed package.
+        subprocess.Popen(
+            ["explorer.exe", "shell:AppsFolder"],
+            creationflags=_no_window_flag(),
+        )
+        return
     if not path.exists():
         raise FileNotFoundError(item.target)
     if sys.platform == "win32":
         if path.is_dir():
             subprocess.Popen(["explorer.exe", str(path)])
-        else:
-            subprocess.Popen(["explorer.exe", f"/select,{path}"])
+        elif not select_windows_shell_item(str(path.resolve())):
+            subprocess.Popen(["explorer.exe", f"/select,{path.resolve()}"])
     else:
         parent = path if path.is_dir() else path.parent
         subprocess.Popen(["open" if sys.platform == "darwin" else "xdg-open", str(parent)])
@@ -1667,6 +2035,89 @@ def _process_matches_target(proc_path: str, proc_name: str, target: Path) -> boo
     if target.suffix.lower() == ".exe":
         return proc_name.lower() == target.name.lower()
     return False
+
+
+def target_window_handles(targets: list[Path]) -> list[int]:
+    """Visible top-level windows owned by processes matching the selected targets."""
+    if sys.platform != "win32" or not targets:
+        return []
+    matching_pids = {
+        int(proc["pid"])
+        for proc in running_processes_detailed()
+        if proc.get("pid")
+        and any(
+            _process_matches_target(proc.get("path", ""), proc.get("name", ""), target)
+            for target in targets
+        )
+    }
+    if not matching_pids:
+        return []
+
+    handles: list[int] = []
+    user32 = ctypes.windll.user32
+    enum_proc_type = ctypes.WINFUNCTYPE(
+        ctypes.c_bool, wintypes.HWND, wintypes.LPARAM
+    )
+
+    def callback(hwnd, _lparam):
+        try:
+            if not user32.IsWindowVisible(hwnd):
+                return True
+            pid = wintypes.DWORD()
+            user32.GetWindowThreadProcessId(hwnd, ctypes.byref(pid))
+            if int(pid.value) in matching_pids:
+                handles.append(int(hwnd))
+        except (AttributeError, OSError, TypeError, ValueError):
+            return True
+        return True
+
+    try:
+        user32.EnumWindows(enum_proc_type(callback), 0)
+    except (AttributeError, OSError, TypeError, ValueError):
+        return []
+    return handles
+
+
+def _external_window_is_topmost(hwnd: int) -> bool:
+    if sys.platform != "win32" or not hwnd:
+        return False
+    try:
+        ex_style = int(
+            ctypes.windll.user32.GetWindowLongW(wintypes.HWND(hwnd), -20)
+        )
+        return bool(ex_style & 0x00000008)  # WS_EX_TOPMOST
+    except (AttributeError, OSError, TypeError, ValueError):
+        return False
+
+
+def target_windows_topmost_state(targets: list[Path]) -> tuple[int, bool]:
+    """Return (visible window count, whether any matching window is topmost)."""
+    handles = target_window_handles(targets)
+    return len(handles), any(_external_window_is_topmost(hwnd) for hwnd in handles)
+
+
+def _set_external_window_topmost(hwnd: int, enabled: bool) -> bool:
+    if sys.platform != "win32" or not hwnd:
+        return False
+    try:
+        insert_after = wintypes.HWND(-1 if enabled else -2)
+        flags = 0x0001 | 0x0002 | 0x0010  # NOSIZE | NOMOVE | NOACTIVATE
+        return bool(
+            ctypes.windll.user32.SetWindowPos(
+                wintypes.HWND(hwnd), insert_after, 0, 0, 0, 0, flags
+            )
+        )
+    except (AttributeError, OSError, TypeError, ValueError):
+        return False
+
+
+def set_target_windows_topmost(targets: list[Path], enabled: bool) -> int:
+    """Set matching visible windows always-on-top and return the changed count."""
+    return sum(
+        1
+        for hwnd in target_window_handles(targets)
+        if _set_external_window_topmost(hwnd, enabled)
+    )
 
 
 def _audio_volume_controls_for_targets(targets: list[Path]) -> list:
@@ -2435,8 +2886,13 @@ def _icon_request_for_item(item: DockItem) -> tuple[str, bool, bool]:
     if item.kind == "folder":
         return "folder", True, True
 
-    if path.suffix.lower() == ".exe" and path.exists():
-        return str(path), False, False
+    if path.suffix.lower() == ".exe":
+        if path.exists():
+            return str(path), False, False
+        if is_windowsapps_path(path):
+            current_target = resolve_current_windowsapps_target(path)
+            if current_target is not None:
+                return str(current_target), False, False
 
     # A shortcut file on disk: pull the real icon the shell shows for it (the
     # target's icon with the shortcut overlay) by reading the actual file

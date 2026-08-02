@@ -333,7 +333,43 @@ class OpenClawBridgeTests(unittest.TestCase):
         self.assertFalse(definition["enabled"])
         self.assertEqual(definition["toolFilter"]["include"], ["passer_control"])
         self.assertNotIn("exclude", definition["toolFilter"])
+        self.assertEqual(
+            definition["env"]["PYINSTALLER_RESET_ENVIRONMENT"],
+            "1",
+        )
         self.assertEqual(commands[1][0][1:], ["mcp", "reload"])
+
+    def test_external_cli_resets_frozen_runtime_for_detached_children(self):
+        completed = subprocess.CompletedProcess(
+            ["openclaw.exe", "status"], 0, stdout=b"ok", stderr=b"",
+        )
+        frozen_environment = {
+            "_PYI_APPLICATION_HOME_DIR": r"C:\Temp\_MEI27122",
+            "TCL_LIBRARY": r"C:\Temp\_MEI27122\_tcl_data",
+            "TK_LIBRARY": r"C:\Temp\_MEI27122\_tk_data",
+        }
+        with mock.patch.object(ai_cli_bridge.sys, "frozen", True, create=True), \
+                mock.patch.dict(ai_cli_bridge.os.environ, frozen_environment), \
+                mock.patch.object(
+                    ai_cli_bridge.subprocess, "run", return_value=completed,
+                ) as run:
+            code, output = ai_cli_bridge._run_cli(
+                ["openclaw.exe", "status"], timeout=10,
+            )
+
+        self.assertEqual((code, output), (0, "ok"))
+        child_env = run.call_args.kwargs["env"]
+        self.assertEqual(child_env["PYINSTALLER_RESET_ENVIRONMENT"], "1")
+        self.assertNotIn("TCL_LIBRARY", child_env)
+        self.assertNotIn("TK_LIBRARY", child_env)
+
+    def test_wechat_login_uses_isolated_environment(self):
+        with mock.patch.object(ai_cli_bridge.sys, "frozen", True, create=True), \
+                mock.patch.object(ai_cli_bridge.subprocess, "Popen") as popen:
+            ai_cli_bridge._spawn_wechat_login(Path("openclaw.exe"))
+
+        child_env = popen.call_args.kwargs["env"]
+        self.assertEqual(child_env["PYINSTALLER_RESET_ENVIRONMENT"], "1")
 
 
 if __name__ == "__main__":

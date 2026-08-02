@@ -315,6 +315,25 @@ class ExceptionLoggingTests(unittest.TestCase):
 
 
 class DeferredStartupTests(unittest.TestCase):
+    def test_registry_discovery_is_published_after_startup(self):
+        app = Passer.RelayDockApp.__new__(Passer.RelayDockApp)
+        app._closing = False
+        app.zotero_path = None
+        app.zotero_menu_label = None
+
+        class _Var:
+            value = False
+
+            def set(self, value):
+                self.value = bool(value)
+
+        app.autostart_var = _Var()
+        app._publish_deferred_system_state(r"C:\Apps\Zotero\zotero.exe", True)
+
+        self.assertEqual(app.zotero_path, r"C:\Apps\Zotero\zotero.exe")
+        self.assertEqual(app.zotero_menu_label, "Zotero 打开")
+        self.assertTrue(app.autostart_var.value)
+
     def test_expensive_ui_startup_steps_are_split_across_event_loop_turns(self):
         app = Passer.RelayDockApp.__new__(Passer.RelayDockApp)
         app._closing = False
@@ -337,6 +356,18 @@ class DeferredStartupTests(unittest.TestCase):
         app.root.callbacks.pop(0)()
         self.assertEqual(events, ["aira", "mods", "integrations", "app_ready"])
         self.assertTrue(app._deferred_startup_completed)
+
+
+class PackagingHardeningTests(unittest.TestCase):
+    def test_release_bundle_uses_fixed_runtime_instead_of_mei_extraction(self):
+        spec = Path(Passer.__file__).with_name("Passer.spec").read_text(
+            encoding="utf-8"
+        )
+        self.assertIn("exclude_binaries=True", spec)
+        self.assertIn('contents_directory="PasserRuntime"', spec)
+        self.assertIn("coll = COLLECT(", spec)
+        self.assertIn('name="."', spec)
+        self.assertNotIn("runtime_tmpdir=", spec)
 
 
 class ResponsivenessTests(unittest.TestCase):

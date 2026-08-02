@@ -5,14 +5,16 @@ from __future__ import annotations
 The bridge is deliberately separate from Passer's loopback-only OpenClaw and
 single-instance sockets.  It exposes only a small non-destructive action
 allowlist, accepts private-network peers, and proves knowledge of the connection
-code with PBKDF2/HMAC without ever putting that code on the wire.
+code with PBKDF2/HMAC while encrypting each session with ephemeral ECDH/AES-GCM.
 """
 
+import base64
 import hashlib
 import hmac
 import ipaddress
 import json
 import os
+import re
 import secrets
 import socket
 import threading
@@ -20,10 +22,15 @@ import time
 from pathlib import Path
 from typing import Any, Callable
 
+from cryptography.hazmat.primitives import hashes, serialization
+from cryptography.hazmat.primitives.asymmetric import ec
+from cryptography.hazmat.primitives.ciphers.aead import AESGCM
+from cryptography.hazmat.primitives.kdf.hkdf import HKDF
+
 from device_lock_tool import protect_password, unprotect_password
 
 
-PROTOCOL = "aira-passer-v1"
+PROTOCOL = "aira-passer-v2"
 DEFAULT_PORT = 50720
 DISCOVERY_PROTOCOL = "aira-passer-discovery-v1"
 DISCOVERY_PORT = 50721
@@ -32,9 +39,12 @@ MAX_MESSAGE_BYTES = 64 * 1024
 MAX_PARAMS_BYTES = 32 * 1024
 PBKDF2_ROUNDS = 120_000
 NONCE_BYTES = 16
+AES_NONCE_BYTES = 12
+SESSION_MATERIAL_BYTES = 96
 AUTH_FAILURE_WINDOW = 300.0
 AUTH_MAX_FAILURES = 5
 AUTH_BLOCK_SECONDS = 300.0
+MAX_CONCURRENT_CLIENTS = 8
 
 # Phone Aira gets a narrower set than OpenClaw. It may list/create scheduled
 # Aira tasks, but cannot add a path/URL to Passer, change settings, operate
@@ -116,12 +126,20 @@ def _valid_code(value: str) -> bool:
     return len(str(value or "")) == 8 and str(value).isdigit()
 
 
-def derive_auth_key(code: str, server_nonce: str, rounds: int = PBKDF2_ROUNDS) -> bytes:
-    if not _valid_code(code) or not _valid_nonce(server_nonce):
-        raise ValueError("连接码或鉴权随机数无效。")
+def _valid_device_id(value: str) -> bool:
+    return bool(re.fullmatch(r"[A-Za-z0-9._-]{8,80}", str(value or "")))
+
+
+def derive_auth_key(code: str, computer_id: str, rounds: int = PBKDF2_ROUNDS) -> bytes:
+    if not _valid_code(code) or len(str(computer_id or "")) != 32:
+        raise ValueError("连接码或电脑身份无效。")
+    try:
+        salt = bytes.fromhex(str(computer_id))
+    except ValueError as exc:
+        raise ValueError("电脑身份必须是 32 位十六进制。") from exc
     safe_rounds = max(10_000, min(500_000, int(rounds)))
     return hashlib.pbkdf2_hmac(
-        "sha256", code.encode("ascii"), bytes.fromhex(server_nonce), safe_rounds
+        "sha256", code.encode("ascii"), salt, safe_rounds
     )
 
 
@@ -129,25 +147,83 @@ def payload_sha256(value: str) -> str:
     return hashlib.sha256(str(value).encode("utf-8")).hexdigest()
 
 
-def auth_proof(
-    key: bytes,
-    role: str,
+def protocol_transcript(
     client_nonce: str,
     server_nonce: str,
     device_id: str,
-    action: str,
-    payload_hash: str,
+    computer_id: str,
+    client_public_key: str,
+    server_public_key: str,
+) -> str:
+    return "|".join((
+        PROTOCOL,
+        str(client_nonce),
+        str(server_nonce),
+        str(device_id),
+        str(computer_id),
+        str(client_public_key),
+        str(server_public_key),
+    ))
+
+
+def derive_session_keys(
+    auth_key: bytes,
+    shared_secret: bytes,
+    transcript: str,
+) -> tuple[bytes, bytes, bytes]:
+    material = HKDF(
+        algorithm=hashes.SHA256(),
+        length=SESSION_MATERIAL_BYTES,
+        salt=auth_key,
+        info=(
+            f"{PROTOCOL}|session|{payload_sha256(transcript)}"
+        ).encode("utf-8"),
+    ).derive(shared_secret)
+    return material[:32], material[32:64], material[64:96]
+
+
+def session_proof(
+    proof_key: bytes,
+    role: str,
+    transcript: str,
+    payload_binding: str,
 ) -> str:
     payload = "|".join((
         PROTOCOL,
         str(role),
-        str(client_nonce),
-        str(server_nonce),
-        str(device_id),
-        str(action),
-        str(payload_hash),
+        payload_sha256(transcript),
+        payload_sha256(payload_binding),
     )).encode("utf-8")
-    return hmac.new(key, payload, hashlib.sha256).hexdigest()
+    return hmac.new(proof_key, payload, hashlib.sha256).hexdigest()
+
+
+def encrypt_payload(key: bytes, aad: str, plaintext: str) -> tuple[str, str]:
+    nonce = secrets.token_bytes(AES_NONCE_BYTES)
+    ciphertext = AESGCM(key).encrypt(
+        nonce,
+        str(plaintext).encode("utf-8"),
+        str(aad).encode("utf-8"),
+    )
+    return (
+        base64.b64encode(nonce).decode("ascii"),
+        base64.b64encode(ciphertext).decode("ascii"),
+    )
+
+
+def decrypt_payload(key: bytes, aad: str, nonce: str, ciphertext: str) -> str:
+    try:
+        raw_nonce = base64.b64decode(str(nonce), validate=True)
+        raw_ciphertext = base64.b64decode(str(ciphertext), validate=True)
+    except (ValueError, TypeError) as exc:
+        raise ValueError("手机加密请求编码无效。") from exc
+    if len(raw_nonce) != AES_NONCE_BYTES or len(raw_ciphertext) < 16:
+        raise ValueError("手机加密请求长度无效。")
+    plaintext = AESGCM(key).decrypt(
+        raw_nonce,
+        raw_ciphertext,
+        str(aad).encode("utf-8"),
+    )
+    return plaintext.decode("utf-8")
 
 
 class AiraMobileBridge:
@@ -178,12 +254,16 @@ class AiraMobileBridge:
         self._computer_id = ""
         self._running = False
         self._code = ""
+        self._cached_auth_key = b""
+        self._cached_auth_code = ""
+        self._cached_auth_computer_id = ""
         self._last_error = ""
         self._last_device = ""
         self._last_ip = ""
         self._last_seen = 0.0
         self._auth_failures: dict[str, list[float]] = {}
         self._auth_blocked_until: dict[str, float] = {}
+        self._client_slots = threading.BoundedSemaphore(MAX_CONCURRENT_CLIENTS)
 
     @property
     def code_path(self) -> Path:
@@ -272,6 +352,9 @@ class AiraMobileBridge:
         self._persist_code(code)
         with self._lock:
             self._code = code
+            self._cached_auth_key = b""
+            self._cached_auth_code = ""
+            self._cached_auth_computer_id = ""
             self._last_device = ""
             self._last_ip = ""
             self._last_seen = 0.0
@@ -285,6 +368,9 @@ class AiraMobileBridge:
             if self._running:
                 return
             self._code = self._load_or_create_code()
+            self._cached_auth_key = b""
+            self._cached_auth_code = ""
+            self._cached_auth_computer_id = ""
             server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
             try:
                 server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
@@ -305,6 +391,23 @@ class AiraMobileBridge:
             self._thread.start()
             self._start_discovery()
         self._notify_status()
+
+    def _base_auth_key(self) -> bytes:
+        code = self.connection_code
+        computer_id = self.computer_id
+        with self._lock:
+            if (
+                self._cached_auth_key
+                and self._cached_auth_code == code
+                and self._cached_auth_computer_id == computer_id
+            ):
+                return self._cached_auth_key
+        value = derive_auth_key(code, computer_id)
+        with self._lock:
+            self._cached_auth_key = value
+            self._cached_auth_code = code
+            self._cached_auth_computer_id = computer_id
+        return value
 
     def _start_discovery(self) -> None:
         discovery = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
@@ -403,12 +506,31 @@ class AiraMobileBridge:
                 continue
             except OSError:
                 break
+            if not self._client_slots.acquire(blocking=False):
+                try:
+                    _send_json(conn, {
+                        "protocol": PROTOCOL,
+                        "ok": False,
+                        "auth": "busy",
+                        "error": "Passer 手机连接繁忙，请稍后重试。",
+                    })
+                except OSError:
+                    pass
+                finally:
+                    conn.close()
+                continue
             threading.Thread(
-                target=self._handle_client,
+                target=self._handle_client_in_slot,
                 args=(conn, address),
                 daemon=True,
                 name="Passer-Aira-Mobile-Client",
             ).start()
+
+    def _handle_client_in_slot(self, conn: socket.socket, address) -> None:
+        try:
+            self._handle_client(conn, address)
+        finally:
+            self._client_slots.release()
 
     def discovery_payload(self) -> dict[str, Any]:
         return {
@@ -491,47 +613,55 @@ class AiraMobileBridge:
             self._auth_failures.pop(ip, None)
             self._auth_blocked_until.pop(ip, None)
 
-    def _signed_result(
+    def _encrypted_result(
         self,
         conn: socket.socket,
         *,
-        key: bytes,
-        client_nonce: str,
-        server_nonce: str,
-        device_id: str,
-        action: str,
+        proof_key: bytes,
+        response_key: bytes,
+        transcript: str,
         envelope: dict[str, Any],
     ) -> None:
         result_json = json.dumps(
             envelope, ensure_ascii=False, separators=(",", ":"), default=str
         )
-        proof = auth_proof(
-            key,
+        nonce, ciphertext = encrypt_payload(
+            response_key,
+            transcript + "|server",
+            result_json,
+        )
+        binding = f"{nonce}|{ciphertext}"
+        proof = session_proof(
+            proof_key,
             "server",
-            client_nonce,
-            server_nonce,
-            device_id,
-            action,
-            payload_sha256(result_json),
+            transcript,
+            binding,
         )
         _send_json(conn, {
+            "protocol": PROTOCOL,
             "ok": True,
             "auth": "ok",
             "server_proof": proof,
-            "result_json": result_json,
+            "response_nonce": nonce,
+            "response_ciphertext": ciphertext,
         })
 
     def _handle_client(self, conn: socket.socket, address) -> None:
         ip = str(address[0] if address else "")
         action = "authenticate"
         try:
-            conn.settimeout(45.0)
+            conn.settimeout(15.0)
             if not is_private_peer(ip):
-                _send_json(conn, {"ok": False, "error": "只允许局域网设备连接。"})
+                _send_json(conn, {
+                    "protocol": PROTOCOL,
+                    "ok": False,
+                    "error": "只允许局域网设备连接。",
+                })
                 return
             retry_after = self._retry_after(ip)
             if retry_after:
                 _send_json(conn, {
+                    "protocol": PROTOCOL,
                     "ok": False,
                     "auth": "blocked",
                     "error": "连接码尝试过于频繁。",
@@ -541,17 +671,20 @@ class AiraMobileBridge:
 
             hello = json.loads((_recv_line(conn).decode("utf-8") or "{}"))
             client_nonce = str(hello.get("client_nonce") or "")
-            device_id = str(hello.get("device_id") or "").strip()[:128]
+            device_id = str(hello.get("device_id") or "").strip()
             device_name = str(hello.get("device_name") or "Aira 手机").strip()[:80]
+            client_public_text = str(hello.get("client_public_key") or "")
             valid_hello = (
                 hello.get("protocol") == PROTOCOL
                 and hello.get("auth") == "hello"
                 and _valid_nonce(client_nonce)
-                and bool(device_id)
+                and _valid_device_id(device_id)
+                and bool(client_public_text)
             )
             if not valid_hello:
                 blocked = self._record_failure(ip)
                 _send_json(conn, {
+                    "protocol": PROTOCOL,
                     "ok": False,
                     "auth": "error",
                     "error": "连接请求无效。",
@@ -559,24 +692,65 @@ class AiraMobileBridge:
                 })
                 return
 
+            try:
+                client_public = serialization.load_der_public_key(
+                    base64.b64decode(client_public_text, validate=True)
+                )
+            except (TypeError, ValueError) as exc:
+                raise ValueError("手机临时公钥无效。") from exc
+            if (
+                not isinstance(client_public, ec.EllipticCurvePublicKey)
+                or not isinstance(client_public.curve, ec.SECP256R1)
+            ):
+                raise ValueError("手机临时公钥必须使用 P-256。")
+
             server_nonce = secrets.token_hex(NONCE_BYTES)
+            server_private = ec.generate_private_key(ec.SECP256R1())
+            server_public_text = base64.b64encode(
+                server_private.public_key().public_bytes(
+                    serialization.Encoding.DER,
+                    serialization.PublicFormat.SubjectPublicKeyInfo,
+                )
+            ).decode("ascii")
+            computer_id = self.computer_id
             _send_json(conn, {
                 "protocol": PROTOCOL,
                 "auth": "challenge",
                 "server_nonce": server_nonce,
                 "rounds": PBKDF2_ROUNDS,
+                "computer_id": computer_id,
+                "computer_name": self.computer_name,
+                "server_public_key": server_public_text,
             })
+            shared_secret = server_private.exchange(ec.ECDH(), client_public)
+            transcript = protocol_transcript(
+                client_nonce,
+                server_nonce,
+                device_id,
+                computer_id,
+                client_public_text,
+                server_public_text,
+            )
+            proof_key, request_key, response_key = derive_session_keys(
+                self._base_auth_key(),
+                shared_secret,
+                transcript,
+            )
+
             response = json.loads((_recv_line(conn).decode("utf-8") or "{}"))
-            action = str(response.get("action") or "").strip().casefold()
-            params_json = str(response.get("params_json") or "{}")
+            request_nonce = str(response.get("request_nonce") or "")
+            request_ciphertext = str(response.get("request_ciphertext") or "")
+            request_binding = f"{request_nonce}|{request_ciphertext}"
             if (
-                response.get("auth") != "response"
+                response.get("protocol") != PROTOCOL
+                or response.get("auth") != "response"
                 or str(response.get("client_nonce") or "") != client_nonce
-                or action not in PHONE_CONTROL_ACTIONS
-                or len(params_json.encode("utf-8")) > MAX_PARAMS_BYTES
+                or not request_nonce
+                or not request_ciphertext
             ):
                 blocked = self._record_failure(ip)
                 _send_json(conn, {
+                    "protocol": PROTOCOL,
                     "ok": False,
                     "auth": "failed",
                     "error": "动作或鉴权响应无效。",
@@ -584,19 +758,16 @@ class AiraMobileBridge:
                 })
                 return
 
-            key = derive_auth_key(self.connection_code, server_nonce)
-            expected = auth_proof(
-                key,
+            expected = session_proof(
+                proof_key,
                 "client",
-                client_nonce,
-                server_nonce,
-                device_id,
-                action,
-                payload_sha256(params_json),
+                transcript,
+                request_binding,
             )
             if not hmac.compare_digest(str(response.get("proof") or ""), expected):
                 blocked = self._record_failure(ip)
                 _send_json(conn, {
+                    "protocol": PROTOCOL,
                     "ok": False,
                     "auth": "failed",
                     "error": "连接码错误。",
@@ -606,9 +777,30 @@ class AiraMobileBridge:
 
             self._clear_failures(ip)
             try:
-                params = json.loads(params_json)
+                request_json = decrypt_payload(
+                    request_key,
+                    transcript + "|client",
+                    request_nonce,
+                    request_ciphertext,
+                )
+                if len(request_json.encode("utf-8")) > MAX_PARAMS_BYTES:
+                    raise ValueError("手机参数过大。")
+                request_value = json.loads(request_json)
             except (TypeError, ValueError) as exc:
-                raise ValueError("手机参数不是有效 JSON。") from exc
+                raise ValueError("手机加密参数不是有效 JSON。") from exc
+            if not isinstance(request_value, dict):
+                raise ValueError("手机请求必须是 JSON 对象。")
+            action = str(request_value.get("action") or "").strip().casefold()
+            params = request_value.get("params")
+            if action not in PHONE_CONTROL_ACTIONS:
+                self._encrypted_result(
+                    conn,
+                    proof_key=proof_key,
+                    response_key=response_key,
+                    transcript=transcript,
+                    envelope={"ok": False, "error": "手机动作不在允许范围内。"},
+                )
+                return
             if not isinstance(params, dict):
                 raise ValueError("手机参数必须是 JSON 对象。")
 
@@ -632,13 +824,11 @@ class AiraMobileBridge:
                         pass
                 envelope = {"ok": False, "error": "Passer 执行动作时发生意外错误。"}
 
-            self._signed_result(
+            self._encrypted_result(
                 conn,
-                key=key,
-                client_nonce=client_nonce,
-                server_nonce=server_nonce,
-                device_id=device_id,
-                action=action,
+                proof_key=proof_key,
+                response_key=response_key,
+                transcript=transcript,
                 envelope=envelope,
             )
         except (OSError, UnicodeError, TypeError, ValueError, json.JSONDecodeError):

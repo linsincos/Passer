@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import base64
 import copy
+import contextlib
 import ctypes
 import hashlib
 import hmac
@@ -75,17 +76,27 @@ _TK_LIBRARY_PATHS = _repair_tk_library_environment()
 
 
 def _sanitize_child_process_tk_environment() -> dict[str, str]:
-    """Keep PyInstaller's private Tcl paths out of programs launched by Passer."""
+    """Keep Passer's private Tcl paths out of programs launched by Passer."""
     removed: dict[str, str] = {}
     sentinels = {"TCL_LIBRARY": "init.tcl", "TK_LIBRARY": "tk.tcl"}
+    bundle_dir = os.path.abspath(str(getattr(sys, "_MEIPASS", "") or ""))
     for variable, sentinel in sentinels.items():
         configured = str(os.environ.get(variable) or "").strip().strip('"')
         if not configured:
             continue
-        parts = os.path.normpath(configured).casefold().split(os.sep)
+        configured_path = os.path.abspath(configured)
+        parts = os.path.normpath(configured_path).casefold().split(os.sep)
         from_mei_bundle = any(part.startswith("_mei") for part in parts)
+        from_frozen_bundle = False
+        if getattr(sys, "frozen", False) and bundle_dir:
+            try:
+                from_frozen_bundle = (
+                    os.path.commonpath((configured_path, bundle_dir)) == bundle_dir
+                )
+            except (OSError, ValueError):
+                from_frozen_bundle = False
         missing = not os.path.isfile(os.path.join(configured, sentinel))
-        if from_mei_bundle or missing:
+        if from_mei_bundle or from_frozen_bundle or missing:
             removed[variable] = configured
             os.environ.pop(variable, None)
     return removed
@@ -104,10 +115,10 @@ from tkinter import colorchooser, filedialog, font as tkfont, messagebox, simple
 from urllib.parse import parse_qs, unquote, urlencode, urlparse
 
 if getattr(sys, "frozen", False):
-    # PyInstaller onefile build: __file__ points into the ephemeral _MEIPASS
-    # temp folder, which is recreated on every launch and deleted on exit.
-    # Persistent data (settings/items/stored files) must therefore live next to
-    # the real .exe, while bundled read-only assets live inside _MEIPASS.
+    # In a PyInstaller bundle, persistent data must live beside the real .exe,
+    # while bundled read-only assets live inside sys._MEIPASS.  The production
+    # onedir build keeps that resource directory stable instead of extracting a
+    # fresh temporary _MEI directory on every launch.
     SCRIPT_DIR = Path(sys.executable).resolve().parent          # writable data / program dir
     RESOURCE_DIR = Path(getattr(sys, "_MEIPASS", SCRIPT_DIR))   # bundled read-only assets
 else:
@@ -156,7 +167,7 @@ ai_list_plugins = None
 ai_run_plugin = None
 ai_usage_summary = None
 
-APP_VERSION = "v1.4.0"
+APP_VERSION = "v1.4.1"
 
 try:
     from tkinterdnd2 import COPY, DND_FILES, REFUSE_DROP, TkinterDnD
@@ -203,8 +214,8 @@ def _compile_passer_part(filename: str, path: Path, source: bytes):
 
     The split files intentionally execute in Passer.py's globals, so importing them
     as regular modules would change behaviour.  A small content-addressed marshal
-    cache retains those shared globals while avoiding roughly 90 ms of repeated
-    parsing/compilation on every source or one-file launch.
+    cache retains those shared globals while avoiding repeated parsing and
+    compilation on every source or bundled launch.
     """
     cache_path = _passer_part_cache_path(filename, source)
     try:
@@ -689,7 +700,9 @@ class RelayDockApp:
 
         self.topmost_var = tk.BooleanVar(value=self.settings["topmost"])
         self.locked_var = tk.BooleanVar(value=self.settings["locked"])
-        self.autostart_var = tk.BooleanVar(value=get_autostart_enabled())
+        # Registry probing is not needed by the startup animation.  Resolve it
+        # with the other deferred system discovery work after the animation.
+        self.autostart_var = tk.BooleanVar(value=False)
         self.transparent_var = tk.BooleanVar(value=self.settings["transparent"])
         self.transparent_alpha_var = tk.DoubleVar(value=self.settings["transparent_alpha"])
         self.ai_enabled_var = tk.BooleanVar(value=self.settings["ai_enabled"])
@@ -934,6 +947,8 @@ class RelayDockApp:
         self.menu.add_separator()
         self.menu.add_command(label="静音", command=self.toggle_mute_selected)
         self.mute_menu_index = self.menu.index(tk.END)
+        self.menu.add_command(label="置顶", command=self.toggle_selected_windows_topmost)
+        self.window_topmost_menu_index = self.menu.index(tk.END)
         self.menu.add_command(label="结束进程", command=self.end_process_selected)
         self.menu.add_command(label="移除", command=self.remove_selected)
         self.menu.add_command(label="删除原文件", command=self.delete_original_selected)
@@ -8605,11 +8620,14 @@ class RelayDockApp:
         self.update_content_size()
         self._schedule_tile_visibility_refresh()
 
-    def _publish_deferred_zotero_path(self, path: str | None) -> None:
+    def _publish_deferred_system_state(
+        self, zotero_path: str | None, autostart_enabled: bool
+    ) -> None:
         if self._closing:
             return
-        self.zotero_path = path
-        self.zotero_menu_label = "Zotero 打开" if path else None
+        self.zotero_path = zotero_path
+        self.zotero_menu_label = "Zotero 打开" if zotero_path else None
+        self.autostart_var.set(bool(autostart_enabled))
 
     def _run_deferred_startup_background(self) -> None:
         """Run non-UI disk/registry maintenance outside the animation path."""
@@ -8634,8 +8652,23 @@ class RelayDockApp:
                 target_path="zotero.exe",
                 expected=(OSError,),
             )
+        autostart_enabled = False
         try:
-            self.root.after(0, lambda value=zotero_path: self._publish_deferred_zotero_path(value))
+            autostart_enabled = get_autostart_enabled()
+        except Exception as exc:
+            self._log_unexpected(
+                exc,
+                module="startup.discovery",
+                action="get_autostart_enabled",
+                target_path=AUTOSTART_RUN_KEY,
+                expected=(OSError,),
+            )
+        try:
+            self.root.after(
+                0,
+                lambda zotero=zotero_path, autostart=autostart_enabled:
+                    self._publish_deferred_system_state(zotero, autostart),
+            )
         except (tk.TclError, RuntimeError):
             pass
 
@@ -9941,6 +9974,13 @@ class RelayDockApp:
                                   state=tk.NORMAL)
         else:
             self.menu.entryconfig(self.mute_menu_index + menu_delta, label="静音", state=tk.DISABLED)
+
+        window_count, windows_topmost = target_windows_topmost_state(mute_targets)
+        self.menu.entryconfig(
+            self.window_topmost_menu_index + menu_delta,
+            label="取消置顶" if windows_topmost else "置顶",
+            state=tk.NORMAL if window_count else tk.DISABLED,
+        )
 
         self.menu.tk_popup(event.x_root, event.y_root)
 
@@ -12024,6 +12064,33 @@ class RelayDockApp:
         changed = set_targets_audio_muted(targets, new_state)
         action = "已静音" if new_state else "已解除静音"
         self.write_status(f"{action} {changed} 个音频会话。")
+
+    def toggle_selected_windows_topmost(self) -> None:
+        targets = self._selected_audio_targets()
+        if not targets:
+            self.write_status("所选项目没有可置顶的程序窗口。")
+            return
+        window_count, currently_topmost = target_windows_topmost_state(targets)
+        if not window_count:
+            messagebox.showinfo(
+                "置顶",
+                "未找到所选程序的可见窗口。\n请先打开程序后再试。",
+                parent=self.root,
+            )
+            self.write_status("未找到所选程序的可见窗口。")
+            return
+        enabled = not currently_topmost
+        changed = set_target_windows_topmost(targets, enabled)
+        if not changed:
+            messagebox.showinfo(
+                "置顶",
+                "无法更改所选程序的窗口置顶状态。",
+                parent=self.root,
+            )
+            self.write_status("窗口置顶状态更改失败。")
+            return
+        action = "已置顶" if enabled else "已取消置顶"
+        self.write_status(f"{action} {changed} 个程序窗口。")
 
     def end_process_selected(self) -> None:
         items = self.selected_items()

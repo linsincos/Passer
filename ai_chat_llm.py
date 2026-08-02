@@ -585,6 +585,80 @@ def call_llm(provider_key: str, api_key: str, history: list[dict],
     return (text or "(空回复)"), usage
 
 
+def call_deepseek_max_context(
+        api_key: str, prompt: str, *, timeout: int = 600,
+        model: str | None = None, reasoning: str | None = None,
+        thinking_mode: str | None = None,
+        max_output_tokens: int | None = None) -> tuple[str, dict]:
+    """通过 DeepSeek 最大上下文通道原样提交一条长文本题目。
+
+    该程序化入口不经过 Aira 的消息数、单消息字符数和历史总字符数裁剪，
+    也不注入记忆、技能、操作协议或 persona；请求正文中只有用户传入的
+    ``prompt``。实际 token 上限由所选 DeepSeek 模型与服务端执行，超限时
+    显式返回服务端错误，绝不静默截短或降级重试。
+    """
+    cfg = PROVIDERS["deepseek"]
+    if not api_key:
+        raise RuntimeError(f"未配置 {cfg['name']} 的 API Key（请在 设置 中填写）。")
+    if not isinstance(prompt, str):
+        raise TypeError("prompt 必须是字符串。")
+    if not prompt.strip():
+        raise ValueError("prompt 不能为空。")
+
+    model_id = str(model).strip() if model and str(model).strip() else cfg["model"]
+    output_limit = AI_MAX_OUTPUT_TOKENS if max_output_tokens is None else int(max_output_tokens)
+    if output_limit <= 0:
+        raise ValueError("max_output_tokens 必须为正整数。")
+
+    effort = normalize_reasoning(reasoning)
+    mode = normalize_thinking_mode(thinking_mode)
+    supports_effort = model_supports_reasoning("deepseek", model_id)
+    supports_mode = model_supports_thinking_mode("deepseek", model_id)
+    explicit_effort = effort != "auto" and supports_effort
+    explicit_mode = mode != "auto" and supports_mode
+    if explicit_effort or explicit_mode or mode != "disabled":
+        timeout = max(timeout, 240)
+
+    payload = {
+        "model": model_id,
+        "messages": [{"role": "user", "content": prompt}],
+        "max_tokens": output_limit,
+        "stream": False,
+    }
+    if explicit_mode:
+        payload["thinking"] = {"type": mode}
+    if mode != "disabled" and explicit_effort:
+        payload["reasoning_effort"] = _reasoning_effort_for_provider("deepseek", effort)
+
+    data = json.dumps(payload, ensure_ascii=False).encode("utf-8")
+    req = urllib.request.Request(
+        cfg["endpoint"],
+        data=data,
+        headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"},
+        method="POST",
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            obj = json.loads(resp.read().decode("utf-8"))
+    except urllib.error.HTTPError as exc:
+        detail = ""
+        try:
+            body = json.loads(exc.read().decode("utf-8"))
+            detail = (body.get("error") or {}).get("message") or str(body)
+        except (OSError, UnicodeError, json.JSONDecodeError, AttributeError):
+            detail = ""
+        raise RuntimeError(f"HTTP {exc.code} {detail}".strip()) from exc
+    except urllib.error.URLError as exc:
+        raise RuntimeError(f"网络错误：{exc.reason}") from exc
+
+    usage = _extract_llm_usage(obj.get("usage") if isinstance(obj, dict) else None, cfg["kind"])
+    choices = obj.get("choices") or [{}]
+    text = (choices[0].get("message") or {}).get("content") or ""
+    text = (text or "").strip()
+    record_token_usage("deepseek", model_id, usage)
+    return (text or "(空回复)"), usage
+
+
 def _stream_llm_response(req, timeout: int, kind: str, on_delta) -> tuple[str, dict]:
     """逐行读取 SSE 流：累计正文并对每段调用 on_delta，结束后返回（全文, token 用量）。"""
     parts: list[str] = []

@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import base64
+import hmac
 import json
 import socket
 import tempfile
@@ -7,21 +9,28 @@ import threading
 import unittest
 from pathlib import Path
 
+from cryptography.hazmat.primitives import serialization
+from cryptography.hazmat.primitives.asymmetric import ec
+
 from aira_mobile_bridge import (
     AiraMobileBridge,
     DISCOVERY_PROTOCOL,
     PHONE_CONTROL_ACTIONS,
     PROTOCOL,
-    auth_proof,
+    decrypt_payload,
     derive_auth_key,
+    derive_session_keys,
+    encrypt_payload,
     is_private_peer,
-    payload_sha256,
+    protocol_transcript,
+    session_proof,
 )
 
 
 def _send(sock: socket.socket, value: dict) -> None:
     sock.sendall(
-        (json.dumps(value, ensure_ascii=False, separators=(",", ":")) + "\n").encode("utf-8")
+        (json.dumps(value, ensure_ascii=False, separators=(",", ":")) + "\n")
+        .encode("utf-8")
     )
 
 
@@ -33,6 +42,102 @@ def _receive(sock: socket.socket) -> dict:
             break
         data.extend(chunk)
     return json.loads(bytes(data).split(b"\n", 1)[0].decode("utf-8"))
+
+
+def _session(
+    client: socket.socket,
+    *,
+    code: str,
+    client_nonce: str,
+    device_id: str,
+):
+    client_private = ec.generate_private_key(ec.SECP256R1())
+    client_public_text = base64.b64encode(
+        client_private.public_key().public_bytes(
+            serialization.Encoding.DER,
+            serialization.PublicFormat.SubjectPublicKeyInfo,
+        )
+    ).decode("ascii")
+    _send(client, {
+        "protocol": PROTOCOL,
+        "auth": "hello",
+        "client_nonce": client_nonce,
+        "device_id": device_id,
+        "device_name": "测试手机",
+        "client_public_key": client_public_text,
+    })
+    challenge = _receive(client)
+    server_public = serialization.load_der_public_key(
+        base64.b64decode(challenge["server_public_key"], validate=True)
+    )
+    shared_secret = client_private.exchange(ec.ECDH(), server_public)
+    transcript = protocol_transcript(
+        client_nonce,
+        challenge["server_nonce"],
+        device_id,
+        challenge["computer_id"],
+        client_public_text,
+        challenge["server_public_key"],
+    )
+    keys = derive_session_keys(
+        derive_auth_key(code, challenge["computer_id"], challenge["rounds"]),
+        shared_secret,
+        transcript,
+    )
+    return challenge, transcript, keys
+
+
+def _encrypted_request(
+    *,
+    client_nonce: str,
+    transcript: str,
+    keys: tuple[bytes, bytes, bytes],
+    action: str,
+    params: dict,
+) -> dict:
+    proof_key, request_key, _response_key = keys
+    request_json = json.dumps(
+        {"action": action, "params": params},
+        ensure_ascii=False,
+        separators=(",", ":"),
+    )
+    nonce, ciphertext = encrypt_payload(
+        request_key,
+        transcript + "|client",
+        request_json,
+    )
+    return {
+        "protocol": PROTOCOL,
+        "auth": "response",
+        "client_nonce": client_nonce,
+        "proof": session_proof(
+            proof_key,
+            "client",
+            transcript,
+            f"{nonce}|{ciphertext}",
+        ),
+        "request_nonce": nonce,
+        "request_ciphertext": ciphertext,
+    }
+
+
+def _decrypted_response(
+    response: dict,
+    transcript: str,
+    keys: tuple[bytes, bytes, bytes],
+) -> dict:
+    proof_key, _request_key, response_key = keys
+    binding = f"{response['response_nonce']}|{response['response_ciphertext']}"
+    expected = session_proof(proof_key, "server", transcript, binding)
+    if not hmac.compare_digest(response["server_proof"], expected):
+        raise AssertionError("server proof mismatch")
+    raw = decrypt_payload(
+        response_key,
+        transcript + "|server",
+        response["response_nonce"],
+        response["response_ciphertext"],
+    )
+    return json.loads(raw)
 
 
 class AiraMobileBridgeTests(unittest.TestCase):
@@ -85,7 +190,7 @@ class AiraMobileBridgeTests(unittest.TestCase):
             finally:
                 bridge.stop()
 
-    def test_authenticated_action_and_signed_result(self):
+    def test_authenticated_action_and_encrypted_result(self):
         calls = []
         with tempfile.TemporaryDirectory() as folder:
             bridge = AiraMobileBridge(
@@ -105,47 +210,26 @@ class AiraMobileBridgeTests(unittest.TestCase):
             worker.start()
 
             client_nonce = "11" * 16
-            device_id = "test-device"
-            _send(client, {
-                "protocol": PROTOCOL,
-                "auth": "hello",
-                "client_nonce": client_nonce,
-                "device_id": device_id,
-                "device_name": "测试手机",
-            })
-            challenge = _receive(client)
-            params_json = json.dumps({"query": "记事本"}, ensure_ascii=False, separators=(",", ":"))
-            key = derive_auth_key("12345678", challenge["server_nonce"], challenge["rounds"])
-            proof = auth_proof(
-                key,
-                "client",
-                client_nonce,
-                challenge["server_nonce"],
-                device_id,
-                "search",
-                payload_sha256(params_json),
+            _challenge, transcript, keys = _session(
+                client,
+                code="12345678",
+                client_nonce=client_nonce,
+                device_id="test-device",
             )
-            _send(client, {
-                "auth": "response",
-                "client_nonce": client_nonce,
-                "action": "search",
-                "params_json": params_json,
-                "proof": proof,
-            })
+            request = _encrypted_request(
+                client_nonce=client_nonce,
+                transcript=transcript,
+                keys=keys,
+                action="search",
+                params={"query": "记事本"},
+            )
+            self.assertNotIn("记事本", json.dumps(request, ensure_ascii=False))
+            _send(client, request)
             response = _receive(client)
             self.assertTrue(response["ok"])
-            result_json = response["result_json"]
-            expected = auth_proof(
-                key,
-                "server",
-                client_nonce,
-                challenge["server_nonce"],
-                device_id,
-                "search",
-                payload_sha256(result_json),
-            )
-            self.assertEqual(response["server_proof"], expected)
-            self.assertTrue(json.loads(result_json)["ok"])
+            self.assertNotIn("messages", json.dumps(response, ensure_ascii=False))
+            result = _decrypted_response(response, transcript, keys)
+            self.assertTrue(result["ok"])
             self.assertEqual(calls, [("search", {"query": "记事本"})])
             self.assertEqual(bridge.snapshot()["last_device"], "测试手机")
             client.close()
@@ -164,35 +248,52 @@ class AiraMobileBridgeTests(unittest.TestCase):
             )
             worker.start()
             client_nonce = "22" * 16
-            _send(client, {
-                "protocol": PROTOCOL,
-                "auth": "hello",
-                "client_nonce": client_nonce,
-                "device_id": "wrong-code-device",
-                "device_name": "手机",
-            })
-            challenge = _receive(client)
-            params_json = "{}"
-            wrong_key = derive_auth_key("87654321", challenge["server_nonce"], challenge["rounds"])
-            _send(client, {
-                "auth": "response",
-                "client_nonce": client_nonce,
-                "action": "status",
-                "params_json": params_json,
-                "proof": auth_proof(
-                    wrong_key,
-                    "client",
-                    client_nonce,
-                    challenge["server_nonce"],
-                    "wrong-code-device",
-                    "status",
-                    payload_sha256(params_json),
-                ),
-            })
+            _challenge, transcript, wrong_keys = _session(
+                client,
+                code="87654321",
+                client_nonce=client_nonce,
+                device_id="wrong-code-device",
+            )
+            _send(client, _encrypted_request(
+                client_nonce=client_nonce,
+                transcript=transcript,
+                keys=wrong_keys,
+                action="status",
+                params={},
+            ))
             response = _receive(client)
             self.assertFalse(response["ok"])
             self.assertEqual(response["auth"], "failed")
             self.assertEqual(calls, [])
+            client.close()
+            worker.join(timeout=2)
+
+    def test_invalid_device_identity_is_rejected_before_challenge(self):
+        with tempfile.TemporaryDirectory() as folder:
+            bridge = AiraMobileBridge(Path(folder), lambda _action, _params: {})
+            server, client = socket.socketpair()
+            worker = threading.Thread(
+                target=bridge._handle_client,
+                args=(server, ("127.0.0.1", 50003)),
+                daemon=True,
+            )
+            worker.start()
+            public_key = ec.generate_private_key(ec.SECP256R1()).public_key()
+            public_text = base64.b64encode(public_key.public_bytes(
+                serialization.Encoding.DER,
+                serialization.PublicFormat.SubjectPublicKeyInfo,
+            )).decode("ascii")
+            _send(client, {
+                "protocol": PROTOCOL,
+                "auth": "hello",
+                "client_nonce": "44" * 16,
+                "device_id": "bad|id",
+                "device_name": "测试手机",
+                "client_public_key": public_text,
+            })
+            response = _receive(client)
+            self.assertFalse(response["ok"])
+            self.assertEqual(response["auth"], "error")
             client.close()
             worker.join(timeout=2)
 
@@ -207,24 +308,24 @@ class AiraMobileBridgeTests(unittest.TestCase):
                 daemon=True,
             )
             worker.start()
-            _send(client, {
-                "protocol": PROTOCOL,
-                "auth": "hello",
-                "client_nonce": "33" * 16,
-                "device_id": "blocked-action",
-                "device_name": "手机",
-            })
-            _receive(client)
-            _send(client, {
-                "auth": "response",
-                "client_nonce": "33" * 16,
-                "action": "add_target",
-                "params_json": "{}",
-                "proof": "0" * 64,
-            })
+            client_nonce = "33" * 16
+            _challenge, transcript, keys = _session(
+                client,
+                code="12345678",
+                client_nonce=client_nonce,
+                device_id="blocked-action",
+            )
+            _send(client, _encrypted_request(
+                client_nonce=client_nonce,
+                transcript=transcript,
+                keys=keys,
+                action="add_target",
+                params={},
+            ))
             response = _receive(client)
-            self.assertFalse(response["ok"])
-            self.assertIn("无效", response["error"])
+            result = _decrypted_response(response, transcript, keys)
+            self.assertFalse(result["ok"])
+            self.assertIn("允许范围", result["error"])
             client.close()
             worker.join(timeout=2)
 

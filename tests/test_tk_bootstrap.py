@@ -4,6 +4,7 @@ import os
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 import Passer
 
@@ -60,6 +61,29 @@ class TkLibraryBootstrapTests(unittest.TestCase):
             preserved = Passer._repair_tk_library_environment()
             self.assertEqual(preserved["TCL_LIBRARY"], str(tcl_dir))
             removed = Passer._sanitize_child_process_tk_environment()
+            self.assertEqual(removed["TCL_LIBRARY"], str(tcl_dir))
+            self.assertEqual(removed["TK_LIBRARY"], str(tk_dir))
+            self.assertNotIn("TCL_LIBRARY", os.environ)
+            self.assertNotIn("TK_LIBRARY", os.environ)
+
+    def test_onedir_runtime_paths_are_removed_before_launching_children(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            runtime = Path(temporary) / "PasserRuntime"
+            tcl_dir = runtime / "_tcl_data"
+            tk_dir = runtime / "_tk_data"
+            tcl_dir.mkdir(parents=True)
+            tk_dir.mkdir(parents=True)
+            (tcl_dir / "init.tcl").write_text("# bundled", encoding="utf-8")
+            (tk_dir / "tk.tcl").write_text("# bundled", encoding="utf-8")
+            os.environ["TCL_LIBRARY"] = str(tcl_dir)
+            os.environ["TK_LIBRARY"] = str(tk_dir)
+
+            with mock.patch.object(Passer.sys, "frozen", True, create=True), \
+                    mock.patch.object(
+                        Passer.sys, "_MEIPASS", str(runtime), create=True,
+                    ):
+                removed = Passer._sanitize_child_process_tk_environment()
+
             self.assertEqual(removed["TCL_LIBRARY"], str(tcl_dir))
             self.assertEqual(removed["TK_LIBRARY"], str(tk_dir))
             self.assertNotIn("TCL_LIBRARY", os.environ)

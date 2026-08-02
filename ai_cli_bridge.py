@@ -6,6 +6,7 @@ import os
 import re
 import shutil
 import subprocess
+import sys
 from pathlib import Path
 
 
@@ -46,6 +47,23 @@ def _timeout(value, default: int, maximum: int = 900) -> int:
         return default
 
 
+def _isolated_external_process_environment() -> dict[str, str]:
+    """Keep external tools and detached Passer children off this onefile runtime."""
+    env = os.environ.copy()
+    if getattr(sys, "frozen", False) or any(
+            key.startswith("_PYI_") for key in env):
+        # OpenClaw can outlive Passer and later launch ``Passer.exe
+        # --openclaw-mcp``.  Force that process to unpack into its own _MEI
+        # directory instead of retaining the GUI process' temporary runtime.
+        env["PYINSTALLER_RESET_ENVIRONMENT"] = "1"
+
+    for variable in ("TCL_LIBRARY", "TK_LIBRARY"):
+        value = str(env.get(variable) or "")
+        if any(part.casefold().startswith("_mei") for part in Path(value).parts):
+            env.pop(variable, None)
+    return env
+
+
 def _run_cli(command: list[str], timeout: int = 120) -> tuple[int, str]:
     flags = getattr(subprocess, "CREATE_NO_WINDOW", 0) if os.name == "nt" else 0
     try:
@@ -56,6 +74,7 @@ def _run_cli(command: list[str], timeout: int = 120) -> tuple[int, str]:
             stdin=subprocess.DEVNULL,
             timeout=timeout,
             creationflags=flags,
+            env=_isolated_external_process_environment(),
             check=False,
         )
     except subprocess.TimeoutExpired as exc:
@@ -205,6 +224,7 @@ def configure_openclaw_passer_mcp(*, enabled: bool, command: str,
         "connectTimeout": 5,
         "supportsParallelToolCalls": False,
         "toolFilter": {"include": ["passer_control"]},
+        "env": {"PYINSTALLER_RESET_ENVIRONMENT": "1"},
     }
     code, output = _run_cli(
         [str(openclaw), "mcp", "set", "passer", json.dumps(definition, ensure_ascii=False)],
@@ -390,13 +410,18 @@ def _install_wechat_cli(spec: dict) -> str:
 def _spawn_wechat_login(openclaw: Path) -> str:
     command = [str(openclaw), "channels", "login", "--channel", "openclaw-weixin"]
     flags = getattr(subprocess, "CREATE_NEW_CONSOLE", 0) if os.name == "nt" else 0
+    env = _isolated_external_process_environment()
     try:
         if os.name == "nt" and openclaw.suffix.lower() in {".cmd", ".bat"}:
             comspec = os.environ.get("COMSPEC") or "cmd.exe"
             command_line = subprocess.list2cmdline(command)
-            subprocess.Popen([comspec, "/d", "/s", "/c", command_line], creationflags=flags)
+            subprocess.Popen(
+                [comspec, "/d", "/s", "/c", command_line],
+                creationflags=flags,
+                env=env,
+            )
         else:
-            subprocess.Popen(command, creationflags=flags)
+            subprocess.Popen(command, creationflags=flags, env=env)
     except OSError as exc:
         return f"无法打开微信 CLI 扫码登录窗口：{exc}"
     return "已打开微信 CLI 扫码登录窗口；请使用手机微信扫码并确认授权。"
