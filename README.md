@@ -1,6 +1,6 @@
 # Passer 
 
-一个 Windows 小型中转软件。
+ Windows 中转软件。
 
 ## 启动
 
