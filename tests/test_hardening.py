@@ -416,15 +416,16 @@ class DeferredStartupTests(unittest.TestCase):
 
 
 class PackagingHardeningTests(unittest.TestCase):
-    def test_release_bundle_uses_fixed_runtime_instead_of_mei_extraction(self):
+    def test_spec_supports_fixed_runtime_and_single_file_release(self):
         spec = Path(Passer.__file__).with_name("Passer.spec").read_text(
             encoding="utf-8"
         )
+        self.assertIn('PASSER_ONEFILE', spec)
+        self.assertIn('a.zipfiles', spec)
         self.assertIn("exclude_binaries=True", spec)
         self.assertIn('contents_directory="PasserRuntime"', spec)
         self.assertIn("coll = COLLECT(", spec)
         self.assertIn('name="Passer"', spec)
-        self.assertNotIn("runtime_tmpdir=", spec)
 
 
 class ResponsivenessTests(unittest.TestCase):

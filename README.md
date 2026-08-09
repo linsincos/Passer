@@ -129,7 +129,7 @@ python Passer.py
 - 手机微信控制还需要 OpenClaw Gateway、腾讯微信插件 `@tencent-weixin/openclaw-weixin`、扫码登录和发送者配对。当前微信通道只支持私聊；仅打开 Passer 中的开关不会自动登录微信，也不会绕过 OpenClaw 的配对与权限限制。
 - 令牌保存在当前数据目录的 `PasserData\OpenClaw\bridge.token`。桥只连接 `127.0.0.1` 上正在运行的 Passer，不监听局域网端口；不要把令牌文件发送给他人。
 - `Passer.spec` 会为同一个 `Passer.exe` 保留 MCP 所需的重定向标准输入/输出，并在普通图形界面启动时提前隐藏自有控制台，因此不需要额外分发桥接 EXE。
-- 发布目录由 `dist\Passer\Passer.exe` 和同级 `dist\Passer\PasserRuntime` 组成，复制或发布时必须一起保留。固定运行库模式不会在每次启动时解压 `_MEI` 临时目录，因此启动和首次工具加载更快，也不会再出现退出时无法删除 `_MEI` 的警告。
+- GitHub Release 提供可直接运行的单文件 `Passer.exe`。单文件版启动时会解压到 `_MEI` 临时目录；开发者若优先考虑启动速度及避免临时目录清理警告，可直接运行 `pyinstaller Passer.spec --noconfirm` 构建 `dist\Passer\Passer.exe + PasserRuntime` 固定运行库版。设置环境变量 `PASSER_ONEFILE=1` 后执行同一命令即可构建 `dist\Passer.exe` 单文件版。
 
 ## 运行时 MOD Loader（EXE 发布后仍可扩展）
 

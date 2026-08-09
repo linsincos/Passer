@@ -1,13 +1,14 @@
 # -*- mode: python ; coding: utf-8 -*-
-"""PyInstaller spec for Passer's fast, cleanup-safe Windows bundle.
+"""PyInstaller spec for Passer's Windows bundles.
 
-Build with:   pyinstaller Passer.spec --noconfirm
+Fast fixed-runtime build:  pyinstaller Passer.spec --noconfirm
+Single-file release build: set PASSER_ONEFILE=1, then run the same command.
 
-Produces ``dist/Passer/Passer.exe`` plus its adjacent ``PasserRuntime`` folder.
-Keeping support files beside the executable avoids one-file's per-launch _MEI
-extraction, which both shortens startup and removes temporary-directory cleanup
-failures.  The flat collection name keeps the public executable path compatible
-with existing shortcuts and OpenClaw registrations.
+The default build produces ``dist/Passer/Passer.exe`` plus its adjacent
+``PasserRuntime`` folder.  ``PASSER_ONEFILE=1`` instead produces the standalone
+``dist/Passer.exe`` used for GitHub releases.  The single file is easier to
+distribute, while the fixed-runtime build starts faster and avoids per-launch
+``_MEI`` extraction.
 
 All optional features remain bundled:
   * QR generate + recognise (pyzbar + its libzbar/libiconv DLLs)
@@ -200,38 +201,63 @@ a = Analysis(
 )
 pyz = PYZ(a.pure, a.zipped_data, cipher=block_cipher)
 
-exe = EXE(
-    pyz,
-    a.scripts,
-    [],
-    exclude_binaries=True,
-    name="Passer",
-    debug=False,
-    bootloader_ignore_signals=False,
-    strip=False,
-    upx=False,
-    upx_exclude=[],
-    contents_directory="PasserRuntime",
-    # Keep redirected stdio available for `Passer.exe --openclaw-mcp`, while
-    # hiding the owned console before Python starts during normal GUI launch.
-    console=True,
-    hide_console="hide-early",
-    disable_windowed_traceback=False,
-    target_arch=None,
-    codesign_identity=None,
-    entitlements_file=None,
-    icon="passer.ico",
-)
+_onefile = _os.environ.get("PASSER_ONEFILE", "").strip() == "1"
 
-coll = COLLECT(
-    exe,
-    a.binaries,
-    a.datas,
-    strip=False,
-    upx=False,
-    upx_exclude=[],
-    name="Passer",
-)
+if _onefile:
+    exe = EXE(
+        pyz,
+        a.scripts,
+        a.binaries,
+        a.zipfiles,
+        a.datas,
+        [],
+        name="Passer",
+        debug=False,
+        bootloader_ignore_signals=False,
+        strip=False,
+        upx=False,
+        upx_exclude=[],
+        console=True,
+        hide_console="hide-early",
+        disable_windowed_traceback=False,
+        target_arch=None,
+        codesign_identity=None,
+        entitlements_file=None,
+        icon="passer.ico",
+    )
+else:
+    exe = EXE(
+        pyz,
+        a.scripts,
+        [],
+        exclude_binaries=True,
+        name="Passer",
+        debug=False,
+        bootloader_ignore_signals=False,
+        strip=False,
+        upx=False,
+        upx_exclude=[],
+        contents_directory="PasserRuntime",
+        # Keep redirected stdio available for `Passer.exe --openclaw-mcp`, while
+        # hiding the owned console before Python starts during normal GUI launch.
+        console=True,
+        hide_console="hide-early",
+        disable_windowed_traceback=False,
+        target_arch=None,
+        codesign_identity=None,
+        entitlements_file=None,
+        icon="passer.ico",
+    )
+
+    coll = COLLECT(
+        exe,
+        a.binaries,
+        a.datas,
+        strip=False,
+        upx=False,
+        upx_exclude=[],
+        name="Passer",
+    )
 
 
 
