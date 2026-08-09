@@ -3,7 +3,7 @@
 
 Build with:   pyinstaller Passer.spec --noconfirm
 
-Produces ``dist/Passer.exe`` plus its ``dist/PasserRuntime`` folder.
+Produces ``dist/Passer/Passer.exe`` plus its adjacent ``PasserRuntime`` folder.
 Keeping support files beside the executable avoids one-file's per-launch _MEI
 extraction, which both shortens startup and removes temporary-directory cleanup
 failures.  The flat collection name keeps the public executable path compatible
@@ -88,7 +88,7 @@ hiddenimports += [
     "random_tool", "markdown_tool", "file_search_tool",
     "magnet_tool", "map_tool", "plan_tool", "file_share_tool",
     "shutdown_tool", "mail_tool", "ai_cli_bridge", "math_render", "popup_manager",
-    "passer_module_api", "automation_tool", "aira_tool", "aira_mobile_bridge", "browser_bridge",
+    "passer_module_api", "automation_tool", "aira_tool", "aira_mobile_bridge", "aira_relay_client", "browser_bridge",
     "image_ocr", "phone_mirror_interaction_tool",
 ]
 
@@ -230,7 +230,7 @@ coll = COLLECT(
     strip=False,
     upx=False,
     upx_exclude=[],
-    name=".",
+    name="Passer",
 )
 
 

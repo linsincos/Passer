@@ -12,7 +12,7 @@ import tkinter as tk
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
-from tkinter import messagebox
+from tkinter import messagebox, simpledialog
 from typing import Callable
 
 from clicker_tool import ClickerTheme
@@ -747,12 +747,22 @@ class AiraService:
         self._history_lock = threading.Lock()
         self.history = self._load_history()
         self.usage_reminder = AiraUsageReminder(app, self.data_dir)
-        self.mobile_bridge = AiraMobileBridge(
-            self.data_dir / "Phone",
-            self._dispatch_mobile_action,
-            status_callback=self._publish_mobile_status,
-            unexpected_callback=self._log_mobile_unexpected,
-        )
+        try:
+            self.mobile_bridge = AiraMobileBridge(
+                self.data_dir / "Phone",
+                self._dispatch_mobile_action,
+                status_callback=self._publish_mobile_status,
+                unexpected_callback=self._log_mobile_unexpected,
+                relay_url=str(self.app.settings.get("aira_relay_url") or ""),
+            )
+        except ValueError:
+            self.app.settings["aira_relay_url"] = ""
+            self.mobile_bridge = AiraMobileBridge(
+                self.data_dir / "Phone",
+                self._dispatch_mobile_action,
+                status_callback=self._publish_mobile_status,
+                unexpected_callback=self._log_mobile_unexpected,
+            )
         if bool(self.app.settings.get("aira_usage_reminder_enabled", False)):
             self.usage_reminder.start()
         if bool(self.app.settings.get("aira_mobile_enabled", False)):
@@ -874,6 +884,9 @@ class AiraService:
 
     def reset_mobile_code(self) -> str:
         return self.mobile_bridge.reset_code()
+
+    def configure_mobile_relay(self, relay_url: str) -> None:
+        self.mobile_bridge.configure_relay(relay_url)
 
     def _dispatch_mobile_action(self, action: str, params: dict) -> dict:
         """Move a phone request onto Tk's UI thread and return its real result."""
@@ -1908,6 +1921,10 @@ class AiraWindow:
             mobile_row, "启用连接", self.toggle_mobile_bridge, primary=True,
         )
         self.mobile_button.pack(side=tk.RIGHT, padx=(8, 18), pady=16)
+        self.mobile_relay_button = self._button(
+            mobile_row, "远程设置", self.configure_mobile_relay,
+        )
+        self.mobile_relay_button.pack(side=tk.RIGHT, padx=(8, 0), pady=16)
         self.mobile_reset_button = self._button(
             mobile_row, "重置连接码", self.reset_mobile_connection_code,
         )
@@ -2187,6 +2204,33 @@ class AiraWindow:
             self.app.write_status(f"手机 Aira 连接码已重置为 {code}。")
         except OSError as exc:
             messagebox.showerror("无法重置手机连接码", str(exc), parent=self.window)
+        self.refresh_mobile_status()
+
+    def configure_mobile_relay(self) -> None:
+        current = str(self.app.settings.get("aira_relay_url") or "")
+        value = simpledialog.askstring(
+            "手机 Aira 公网中继",
+            "填写 HTTPS 中继地址。留空会关闭远程连接；局域网连接仍然保留。\n\n"
+            "中继不能读取动作和结果，但会看到 IP、连接时间和电脑 ID 等元数据。\n\n"
+            "示例：https://relay.example.com",
+            initialvalue=current,
+            parent=self.window,
+        )
+        if value is None:
+            return
+        try:
+            self.service.configure_mobile_relay(value.strip())
+            self.app.settings["aira_relay_url"] = self.service.mobile_bridge.relay_url
+            self.save_settings()
+            if value.strip():
+                messagebox.showinfo(
+                    "公网中继已保存",
+                    "请让手机与电脑先处于同一局域网，并在手机执行一次“连接测试”。\n"
+                    "测试成功后，手机会通过加密连接自动取得远程配置。",
+                    parent=self.window,
+                )
+        except (OSError, ValueError) as exc:
+            messagebox.showerror("公网中继地址无效", str(exc), parent=self.window)
         self.refresh_mobile_status()
 
     def refresh_mobile_status(self) -> None:

@@ -167,7 +167,7 @@ ai_list_plugins = None
 ai_run_plugin = None
 ai_usage_summary = None
 
-APP_VERSION = "v1.4.1"
+APP_VERSION = "v1.5.0"
 
 try:
     from tkinterdnd2 import COPY, DND_FILES, REFUSE_DROP, TkinterDnD
@@ -519,6 +519,10 @@ class RelayDockApp:
         self.ai_persona: str = str(self.settings.get("ai_persona") or "default")
         self.ai_permission: str = str(self.settings.get("ai_permission") or "auto_approve")
         self.ai_prompt_cache: bool = bool(self.settings.get("ai_prompt_cache", True))
+        self.ai_external_interface_enabled: bool = bool(
+            self.settings.get("ai_external_interface_enabled", False)
+            and self.settings.get("ai_enabled", False)
+        )
         self.openclaw_enabled: bool = bool(self.settings.get("openclaw_enabled", False))
         self._openclaw_bridge_token = ""
         self.search_hotkey = str(self.settings.get("search_hotkey") or "Alt+Space")
@@ -1421,6 +1425,9 @@ class RelayDockApp:
             "opacity_percent": round(float(self.transparent_alpha_var.get()) * 100),
             "window_size": f"{self.root.winfo_width()}x{self.root.winfo_height()}",
             "ai_enabled": bool(self.ai_enabled_var.get()),
+            "ai_external_interface_enabled": bool(
+                self.ai_enabled_var.get() and self.ai_external_interface_enabled
+            ),
             "ai_provider": provider,
             "ai_model": model,
             "thinking_mode": self.ai_thinking_mode,
@@ -1478,6 +1485,8 @@ class RelayDockApp:
         protected = {
             "api_key", "api_keys", "ai_keys", "password", "token",
             "ai_permission", "permission", "openclaw_enabled", "openclaw",
+            "ai_external_interface_enabled", "external_interface_enabled",
+            "external_interface",
         }
         blocked = sorted(protected.intersection(raw))
         if blocked:
@@ -1652,8 +1661,13 @@ class RelayDockApp:
             self.refresh_transparency_windows()
         if "window_width" in values or "window_height" in values:
             self.root.geometry(f"{values['window_width']}x{values['window_height']}")
+        external_interface_forced_off = False
         if "ai_enabled" in values:
             self.ai_enabled_var.set(bool(values["ai_enabled"]))
+            if not bool(values["ai_enabled"]):
+                self.ai_external_interface_enabled = False
+                self.settings["ai_external_interface_enabled"] = False
+                external_interface_forced_off = True
         if "ai_provider" in values:
             self.ai_provider_var.set(str(values["ai_provider"]))
         if "ai_model" in values:
@@ -1693,6 +1707,8 @@ class RelayDockApp:
         if self.ai_chat is not None:
             self.ai_chat.sync_provider()
         self.save()
+        if external_interface_forced_off and self.openclaw_enabled:
+            self.apply_openclaw_setting(self.openclaw_enabled, notify=False)
         self.write_status("Aira 已调整并保存 Passer 设置。")
         result = {key: value for key, value in values.items() if key != "ai_model_provider"}
         return "Passer 设置已更新：" + json.dumps(result, ensure_ascii=False)
@@ -6546,6 +6562,8 @@ class RelayDockApp:
             aira_font_size=self.aira_font_size_label,
             aira_line_spacing=self.aira_line_spacing_label,
             aira_mobile_enabled=self.settings.get("aira_mobile_enabled", False),
+            aira_relay_url=self.settings.get("aira_relay_url", ""),
+            ai_external_interface_enabled=self.ai_external_interface_enabled,
         )
         self._recent_search_dirty = False
 
@@ -7301,7 +7319,11 @@ class RelayDockApp:
         return token
 
     def _initialize_openclaw_bridge_runtime(self) -> None:
-        if not self.openclaw_enabled:
+        if not (
+            self.openclaw_enabled
+            and self.ai_enabled_var.get()
+            and self.ai_external_interface_enabled
+        ):
             return
         try:
             self._ensure_openclaw_bridge_token()
@@ -7328,8 +7350,13 @@ class RelayDockApp:
         """Apply the local auth gate, then synchronize OpenClaw in the background."""
         self.openclaw_enabled = bool(enabled)
         self.settings["openclaw_enabled"] = self.openclaw_enabled
+        bridge_enabled = bool(
+            self.openclaw_enabled
+            and self.ai_enabled_var.get()
+            and self.ai_external_interface_enabled
+        )
         token_path = self._openclaw_bridge_token_path()
-        if self.openclaw_enabled:
+        if bridge_enabled:
             try:
                 self._ensure_openclaw_bridge_token()
             except OSError as exc:
@@ -7350,14 +7377,18 @@ class RelayDockApp:
                 if notify:
                     messagebox.showinfo("OpenClaw 启用失败", str(exc), parent=self.root)
                 return
-        else:
+        elif not self.openclaw_enabled:
             self._openclaw_bridge_token = ""
             try:
                 token_path.unlink(missing_ok=True)
             except OSError:
                 pass
+        else:
+            # Keep the persisted OpenClaw preference, while the master external
+            # interface gate prevents registration and local bridge access.
+            self._openclaw_bridge_token = ""
 
-        desired_enabled = self.openclaw_enabled
+        desired_enabled = bridge_enabled
         command, arguments, cwd = self._openclaw_mcp_launch_spec()
 
         def worker() -> None:
@@ -7403,6 +7434,22 @@ class RelayDockApp:
             target=worker, daemon=True, name="Passer-OpenClawConfig"
         ).start()
 
+    def _external_ai_interface_active(self) -> bool:
+        try:
+            aira_enabled = bool(self.ai_enabled_var.get())
+        except (AttributeError, RuntimeError, tk.TclError):
+            aira_enabled = False
+        return bool(
+            aira_enabled
+            and getattr(self, "ai_external_interface_enabled", False)
+        )
+
+    def _require_external_ai_interface(self, source_name: str) -> None:
+        if not self._external_ai_interface_active():
+            raise PermissionError(
+                f"{source_name} 无法调用 Passer：请先在设置中开启 Aira 和“启用外置接口”。"
+            )
+
     def _dispatch_control_request(
         self,
         action: str,
@@ -7436,6 +7483,7 @@ class RelayDockApp:
                 "window_visible": visible,
                 "items": len(self.items),
                 "aira_enabled": bool(self.ai_enabled_var.get()),
+                "external_interface_enabled": self._external_ai_interface_active(),
                 "allowed_actions": list(allowed),
             }
             mobile_bridge = getattr(
@@ -7447,6 +7495,7 @@ class RelayDockApp:
                 identity = mobile_bridge.snapshot()
                 status["computer_id"] = str(identity.get("computer_id") or "")
                 status["computer_name"] = str(identity.get("computer_name") or "Passer")
+                status.update(mobile_bridge.remote_pairing_payload())
             return status
         if action == "summon":
             self.summon_window()
@@ -7506,7 +7555,7 @@ class RelayDockApp:
                 "truncated": len(all_tasks) > len(tasks),
                 "active_count": active_count,
                 "server_time": datetime.now().isoformat(timespec="seconds"),
-                "refresh_after_ms": 2500 if active_count else 10000,
+                "refresh_after_ms": 5000 if active_count else 30000,
             }
         if action == "add_task":
             if len(getattr(self, "automations", [])) >= 200:
@@ -7611,6 +7660,7 @@ class RelayDockApp:
 
     def _dispatch_openclaw_request(self, action: str, params: dict) -> dict:
         """Run one non-destructive, explicitly allowlisted OpenClaw action."""
+        self._require_external_ai_interface("OpenClaw")
         if not self.openclaw_enabled:
             raise PermissionError("Passer 设置中的“启用 OpenClaw”当前已关闭。")
         return self._dispatch_control_request(
@@ -7624,6 +7674,8 @@ class RelayDockApp:
         """Run an authenticated Aira Mobile action with its narrower allowlist."""
         if not bool(self.settings.get("aira_mobile_enabled", False)):
             raise PermissionError("Aira 中的“手机连接”当前已关闭。")
+        if str(action or "").strip().casefold() == "add_task":
+            self._require_external_ai_interface("手机 Aira")
         allowed_actions = _load_symbol(
             "aira_mobile_bridge", "PHONE_CONTROL_ACTIONS"
         )
@@ -7672,6 +7724,12 @@ class RelayDockApp:
                     continue
                 if not isinstance(payload, dict) or payload.get("protocol") != OPENCLAW_BRIDGE_PROTOCOL:
                     conn.sendall(b'{"ok":false,"error":"invalid protocol"}\n')
+                    continue
+                if not bool(getattr(self, "ai_external_interface_enabled", False)):
+                    conn.sendall(json.dumps(
+                        {"ok": False, "error": "Passer external AI interface is disabled."},
+                        ensure_ascii=False,
+                    ).encode("utf-8") + b"\n")
                     continue
                 if not self.openclaw_enabled:
                     conn.sendall(json.dumps(
@@ -7746,7 +7804,10 @@ class RelayDockApp:
         if summon:
             self.summon_window()
         try:
-            self.root.after(80 if self.openclaw_enabled else 400, self._poll_instance_pings)
+            self.root.after(
+                80 if self.openclaw_enabled and self._external_ai_interface_active() else 400,
+                self._poll_instance_pings,
+            )
         except tk.TclError:
             pass
 
@@ -13158,6 +13219,57 @@ class RelayDockApp:
         ai_button.pack(side=tk.RIGHT)
         refresh_ai_button()
 
+        external_interface_local = tk.BooleanVar(value=bool(
+            ai_enabled_local.get()
+            and getattr(self, "ai_external_interface_enabled", True)
+        ))
+        external_interface_row = tk.Frame(ai, bg=SURFACE_BG)
+        external_interface_row.pack(fill=tk.X, pady=(8, 0))
+        tk.Label(
+            external_interface_row, text="启用外置接口", bg=SURFACE_BG,
+            fg="#111827", anchor=tk.W, font=app_font(10, "bold"),
+        ).pack(side=tk.LEFT)
+        external_interface_button = tk.Button(
+            external_interface_row, bd=0, relief=tk.FLAT, padx=16, pady=7,
+            cursor="hand2", font=app_font(9, "bold"),
+        )
+
+        def refresh_external_interface_button() -> None:
+            aira_on = bool(ai_enabled_local.get())
+            if not aira_on:
+                external_interface_local.set(False)
+            on = bool(aira_on and external_interface_local.get())
+            external_interface_button.configure(
+                text="已开启" if on else "已关闭",
+                state=tk.NORMAL if aira_on else tk.DISABLED,
+                cursor="hand2" if aira_on else "arrow",
+                bg=ACCENT_SOFT if on else "#eef2f7",
+                fg=ACCENT if on else "#94a3b8",
+                activebackground=ACCENT_SOFT_HOVER if on else "#e2e8f0",
+                activeforeground=ACCENT if on else "#64748b",
+                disabledforeground="#94a3b8",
+            )
+
+        def toggle_external_interface() -> None:
+            if not ai_enabled_local.get():
+                return
+            external_interface_local.set(not external_interface_local.get())
+            refresh_external_interface_button()
+
+        def toggle_ai_enabled() -> None:
+            enabled = not ai_enabled_local.get()
+            ai_enabled_local.set(enabled)
+            # The external interface defaults on with Aira, but can still be
+            # turned off independently while Aira remains enabled.
+            external_interface_local.set(enabled)
+            refresh_ai_button()
+            refresh_external_interface_button()
+
+        ai_button.configure(command=toggle_ai_enabled)
+        external_interface_button.configure(command=toggle_external_interface)
+        external_interface_button.pack(side=tk.RIGHT)
+        refresh_external_interface_button()
+
         prompt_cache_local = tk.BooleanVar(value=bool(getattr(self, "ai_prompt_cache", True)))
         cache_row = tk.Frame(ai, bg=SURFACE_BG)
         cache_row.pack(fill=tk.X, pady=(8, 0))
@@ -13607,7 +13719,14 @@ class RelayDockApp:
             self.settings["theme_color"] = self.theme_color
             self.settings["background_color"] = self.background_color
             self.settings["background_image"] = self.background_image
+            external_interface_changed = (
+                bool(ai_enabled_local.get() and external_interface_local.get())
+                != bool(self.ai_external_interface_enabled)
+            )
             self.ai_enabled_var.set(ai_enabled_local.get())
+            self.ai_external_interface_enabled = bool(
+                ai_enabled_local.get() and external_interface_local.get()
+            )
             self.ai_provider_var.set(AI_NAME_TO_KEY.get(provider_local.get(), "deepseek"))
             self.ai_keys = {k: v.get().strip() for k, v in key_vars.items()}
             self.ai_thinking_mode = thinking_mode_key_of.get(thinking_mode_local.get(), "auto")
@@ -13629,6 +13748,9 @@ class RelayDockApp:
             self.hotkey_ai_down = False
             self.settings["ai_permission"] = self.ai_permission
             self.settings["ai_prompt_cache"] = self.ai_prompt_cache
+            self.settings["ai_external_interface_enabled"] = (
+                self.ai_external_interface_enabled
+            )
             self.settings["openclaw_enabled"] = self.openclaw_enabled
             open_mode_notices: list[str] = []
             chosen_office_mode = OFFICE_OPEN_MODE_BY_LABEL.get(office_mode_local.get(), OFFICE_OPEN_MODE_BUILTIN)
@@ -13661,7 +13783,11 @@ class RelayDockApp:
             self.apply_ai_settings()
             self.remember_settings_window_position(dialog)
             self.save()
-            if openclaw_changed or (openclaw_data_dir_changed and self.openclaw_enabled):
+            if (
+                openclaw_changed
+                or external_interface_changed
+                or (openclaw_data_dir_changed and self.openclaw_enabled)
+            ):
                 self.apply_openclaw_setting(self.openclaw_enabled)
             settings_saved["value"] = True
             self.write_status("设置已保存。")
@@ -13721,6 +13847,9 @@ class RelayDockApp:
     def _reload_after_data_change(self, dialog=None, keep_items: bool = False) -> None:
         """重新从磁盘载入设置（及可选项目），并刷新界面。用于恢复/导入数据后。"""
         previous_openclaw_enabled = bool(getattr(self, "openclaw_enabled", False))
+        previous_external_interface_enabled = bool(
+            getattr(self, "ai_external_interface_enabled", False)
+        )
         if dialog is not None:
             try:
                 self.settings_window = None
@@ -13746,6 +13875,10 @@ class RelayDockApp:
         self.ai_persona = str(self.settings.get("ai_persona") or "default")
         self.ai_permission = str(self.settings.get("ai_permission") or "auto_approve")
         self.ai_prompt_cache = bool(self.settings.get("ai_prompt_cache", True))
+        self.ai_external_interface_enabled = bool(
+            self.settings.get("ai_external_interface_enabled", False)
+            and self.ai_enabled_var.get()
+        )
         self.openclaw_enabled = bool(self.settings.get("openclaw_enabled", False))
         self.search_hotkey = str(self.settings.get("search_hotkey") or "Alt+Space")
         self.ai_hotkey = str(self.settings.get("ai_hotkey") or "Alt+Shift+Space")
@@ -13770,9 +13903,13 @@ class RelayDockApp:
         except Exception:
             pass
         try:
-            if self.openclaw_enabled != previous_openclaw_enabled:
+            if (
+                self.openclaw_enabled != previous_openclaw_enabled
+                or self.ai_external_interface_enabled
+                != previous_external_interface_enabled
+            ):
                 self.apply_openclaw_setting(self.openclaw_enabled, notify=False)
-            elif self.openclaw_enabled:
+            elif self.openclaw_enabled and self.ai_external_interface_enabled:
                 self._initialize_openclaw_bridge_runtime()
         except Exception:
             pass

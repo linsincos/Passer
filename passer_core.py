@@ -2639,6 +2639,7 @@ def load_settings() -> dict:
         stored_share_code = unprotect_password(stored_share_code)
     if not (4 <= len(stored_share_code) <= 8 and stored_share_code.isdigit()):
         stored_share_code = ""
+    ai_enabled = bool(settings.get("ai_enabled", False))
     return {
         "schema_version": SETTINGS_SCHEMA_VERSION,
         "topmost": bool(settings.get("topmost", True)),
@@ -2678,7 +2679,10 @@ def load_settings() -> dict:
                 and str(item.get("target", "")) not in REMOVED_BUILTIN_TARGETS
             )
         ][:SEARCH_RECENT_LIMIT],
-        "ai_enabled": bool(settings.get("ai_enabled", False)),
+        "ai_enabled": ai_enabled,
+        "ai_external_interface_enabled": bool(
+            ai_enabled and settings.get("ai_external_interface_enabled", True)
+        ),
         "ai_provider": str(settings.get("ai_provider") or "deepseek"),
         "ai_keys": load_ai_keys(settings.get("ai_keys")),
         "ai_models": load_ai_models(settings.get("ai_models")),
@@ -2728,6 +2732,7 @@ def load_settings() -> dict:
             settings.get("aira_usage_notify_mode")
         ),
         "aira_mobile_enabled": bool(settings.get("aira_mobile_enabled", False)),
+        "aira_relay_url": str(settings.get("aira_relay_url") or "").strip()[:2048],
     }
 
 
@@ -2790,6 +2795,8 @@ def save_settings(
     aira_font_size: str = DEFAULT_FONT_SIZE_LABEL,
     aira_line_spacing: str = DEFAULT_AIRA_LINE_SPACING_LABEL,
     aira_mobile_enabled: bool = False,
+    aira_relay_url: str = "",
+    ai_external_interface_enabled: bool = True,
 ) -> None:
     clear_share_code = str(file_share_code or "").strip()
     protected_share_code = protect_password(clear_share_code) if clear_share_code else ""
@@ -2821,6 +2828,9 @@ def save_settings(
             "store_dir": str(store_dir or STORE_DIR),
             "recent_search_items": list(recent_search_items or [])[:SEARCH_RECENT_LIMIT],
             "ai_enabled": bool(ai_enabled),
+            "ai_external_interface_enabled": bool(
+                ai_enabled and ai_external_interface_enabled
+            ),
             "ai_provider": str(ai_provider or "deepseek"),
             "ai_keys": protect_ai_keys(ai_keys),
             "ai_models": load_ai_models(ai_models),
@@ -2866,6 +2876,7 @@ def save_settings(
             "aira_usage_reminder_enabled": bool(aira_usage_reminder_enabled),
             "aira_usage_notify_mode": normalize_aira_notify_mode(aira_usage_notify_mode),
             "aira_mobile_enabled": bool(aira_mobile_enabled),
+            "aira_relay_url": str(aira_relay_url or "").strip()[:2048],
         },
     )
 

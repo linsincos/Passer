@@ -6,7 +6,9 @@ import json
 import socket
 import tempfile
 import threading
+import time
 import unittest
+import urllib.request
 from pathlib import Path
 
 from cryptography.hazmat.primitives import serialization
@@ -19,12 +21,15 @@ from aira_mobile_bridge import (
     PROTOCOL,
     decrypt_payload,
     derive_auth_key,
+    derive_remote_auth_key,
     derive_session_keys,
     encrypt_payload,
     is_private_peer,
     protocol_transcript,
     session_proof,
 )
+from aira_relay_client import relay_credential
+from relay.aira_relay_server import RelayHttpServer
 
 
 def _send(sock: socket.socket, value: dict) -> None:
@@ -141,6 +146,122 @@ def _decrypted_response(
 
 
 class AiraMobileBridgeTests(unittest.TestCase):
+    def test_remote_auth_vector_matches_android(self):
+        computer_id = "00112233445566778899aabbccddeeff"
+        token = "A" * 43
+        base = derive_auth_key("12345678", computer_id)
+        self.assertEqual(
+            base.hex(),
+            "23b8e77d3286f365a7c119d157d39d7c9003b439e726a9a8797d6d251edb1c5b",
+        )
+        self.assertEqual(
+            derive_remote_auth_key(base, token).hex(),
+            "8a2e8b32b1f517997fbdaca4fd6d6e237be3cc3ab831e7e22b97db5483a14ca3",
+        )
+
+    def test_full_encrypted_action_over_http_relay(self):
+        token = "A" * 43
+        code = "12345678"
+        calls = []
+        relay_server = RelayHttpServer(("127.0.0.1", 0))
+        relay_thread = threading.Thread(target=relay_server.serve_forever, daemon=True)
+        relay_thread.start()
+        relay_url = f"http://127.0.0.1:{relay_server.server_address[1]}"
+
+        with tempfile.TemporaryDirectory() as folder:
+            bridge = AiraMobileBridge(
+                Path(folder),
+                lambda action, params: calls.append((action, params)) or {
+                    "messages": ["remote-ok"]
+                },
+                port=0,
+                discovery_port=0,
+                relay_url=relay_url,
+            )
+            bridge._load_or_create_code = lambda: code
+            bridge._remote_token = token
+            bridge.start()
+            try:
+                deadline = time.monotonic() + 3
+                while not bridge.snapshot()["remote_connected"] and time.monotonic() < deadline:
+                    time.sleep(0.02)
+                self.assertTrue(
+                    bridge.snapshot()["remote_connected"],
+                    bridge.snapshot()["remote_error"],
+                )
+                computer_id = bridge.computer_id
+                credential = relay_credential(computer_id, token)
+
+                def post(path, value):
+                    body = dict(value)
+                    body["computer_id"] = computer_id
+                    request = urllib.request.Request(
+                        relay_url + path,
+                        data=json.dumps(body).encode("utf-8"),
+                        method="POST",
+                        headers={
+                            "Authorization": f"Bearer {credential}",
+                            "Content-Type": "application/json",
+                        },
+                    )
+                    with urllib.request.urlopen(request, timeout=5) as response:
+                        return json.loads(response.read().decode("utf-8"))
+
+                client_nonce = "55" * 16
+                device_id = "remote-phone"
+                private_key = ec.generate_private_key(ec.SECP256R1())
+                client_public = base64.b64encode(
+                    private_key.public_key().public_bytes(
+                        serialization.Encoding.DER,
+                        serialization.PublicFormat.SubjectPublicKeyInfo,
+                    )
+                ).decode("ascii")
+                opened = post("/v1/mobile/open", {"payload": {
+                    "protocol": PROTOCOL,
+                    "auth": "hello",
+                    "client_nonce": client_nonce,
+                    "device_id": device_id,
+                    "device_name": "远程测试手机",
+                    "client_public_key": client_public,
+                }})
+                challenge = opened["payload"]
+                self.assertTrue(challenge["relay"])
+                server_public = serialization.load_der_public_key(
+                    base64.b64decode(challenge["server_public_key"], validate=True)
+                )
+                shared = private_key.exchange(ec.ECDH(), server_public)
+                transcript = protocol_transcript(
+                    client_nonce,
+                    challenge["server_nonce"],
+                    device_id,
+                    challenge["computer_id"],
+                    client_public,
+                    challenge["server_public_key"],
+                ) + "|relay"
+                base_key = derive_auth_key(code, computer_id, challenge["rounds"])
+                keys = derive_session_keys(
+                    derive_remote_auth_key(base_key, token), shared, transcript
+                )
+                request_frame = _encrypted_request(
+                    client_nonce=client_nonce,
+                    transcript=transcript,
+                    keys=keys,
+                    action="search",
+                    params={"query": "远程项目"},
+                )
+                finished = post("/v1/mobile/continue", {
+                    "session_id": opened["session_id"],
+                    "payload": request_frame,
+                })
+                result = _decrypted_response(finished["payload"], transcript, keys)
+                self.assertTrue(result["ok"])
+                self.assertEqual(calls, [("search", {"query": "远程项目"})])
+            finally:
+                bridge.stop()
+        relay_server.shutdown()
+        relay_server.server_close()
+        relay_thread.join(2)
+
     def test_private_peer_gate(self):
         self.assertTrue(is_private_peer("127.0.0.1"))
         self.assertTrue(is_private_peer("192.168.10.22"))

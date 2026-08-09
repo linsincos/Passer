@@ -27,6 +27,7 @@ from cryptography.hazmat.primitives.asymmetric import ec
 from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 from cryptography.hazmat.primitives.kdf.hkdf import HKDF
 
+from aira_relay_client import AiraRelayClient, normalize_relay_url
 from device_lock_tool import protect_password, unprotect_password
 
 
@@ -143,6 +144,16 @@ def derive_auth_key(code: str, computer_id: str, rounds: int = PBKDF2_ROUNDS) ->
     )
 
 
+def derive_remote_auth_key(base_auth_key: bytes, remote_token: str) -> bytes:
+    if not re.fullmatch(r"[A-Za-z0-9_-]{43,128}", str(remote_token or "")):
+        raise ValueError("远程令牌无效。")
+    return hmac.new(
+        remote_token.encode("ascii"),
+        f"{PROTOCOL}|relay-auth|".encode("ascii") + bytes(base_auth_key),
+        hashlib.sha256,
+    ).digest()
+
+
 def payload_sha256(value: str) -> str:
     return hashlib.sha256(str(value).encode("utf-8")).hexdigest()
 
@@ -238,6 +249,7 @@ class AiraMobileBridge:
         unexpected_callback: Callable[[BaseException, str, Path], None] | None = None,
         port: int = DEFAULT_PORT,
         discovery_port: int = DISCOVERY_PORT,
+        relay_url: str = "",
     ) -> None:
         self.state_dir = Path(state_dir)
         self.action_handler = action_handler
@@ -245,6 +257,7 @@ class AiraMobileBridge:
         self.unexpected_callback = unexpected_callback
         self.port = int(port)
         self.discovery_port = int(discovery_port)
+        self._relay_url = normalize_relay_url(relay_url)
         self._lock = threading.RLock()
         self._server: socket.socket | None = None
         self._thread: threading.Thread | None = None
@@ -264,6 +277,10 @@ class AiraMobileBridge:
         self._auth_failures: dict[str, list[float]] = {}
         self._auth_blocked_until: dict[str, float] = {}
         self._client_slots = threading.BoundedSemaphore(MAX_CONCURRENT_CLIENTS)
+        self._relay_client: AiraRelayClient | None = None
+        self._remote_token = ""
+        self._remote_connected = False
+        self._remote_error = ""
 
     @property
     def code_path(self) -> Path:
@@ -272,6 +289,10 @@ class AiraMobileBridge:
     @property
     def computer_id_path(self) -> Path:
         return self.state_dir / "computer.id"
+
+    @property
+    def remote_token_path(self) -> Path:
+        return self.state_dir / "remote.token"
 
     @property
     def computer_id(self) -> str:
@@ -321,6 +342,73 @@ class AiraMobileBridge:
                 self._code = self._load_or_create_code()
             return self._code
 
+    @property
+    def relay_url(self) -> str:
+        with self._lock:
+            return self._relay_url
+
+    @property
+    def remote_token(self) -> str:
+        with self._lock:
+            if self._remote_token:
+                return self._remote_token
+        try:
+            protected = self.remote_token_path.read_text(encoding="utf-8").strip()
+        except OSError:
+            protected = ""
+        token = unprotect_password(protected) if protected else ""
+        if not re.fullmatch(r"[A-Za-z0-9_-]{43,128}", str(token or "")):
+            token = secrets.token_urlsafe(32)
+            self._persist_remote_token(token)
+        with self._lock:
+            self._remote_token = token
+        return token
+
+    def _persist_remote_token(self, token: str) -> None:
+        protected = protect_password(token)
+        if not protected:
+            raise OSError("无法使用 Windows 当前账户保护远程连接令牌。")
+        self.state_dir.mkdir(parents=True, exist_ok=True)
+        temporary = self.remote_token_path.with_name(
+            f".{self.remote_token_path.name}.{secrets.token_hex(6)}.tmp"
+        )
+        try:
+            temporary.write_text(protected + "\n", encoding="utf-8")
+            os.replace(temporary, self.remote_token_path)
+        finally:
+            temporary.unlink(missing_ok=True)
+
+    def configure_relay(self, relay_url: str) -> None:
+        normalized = normalize_relay_url(relay_url)
+        with self._lock:
+            changed = normalized != self._relay_url
+            self._relay_url = normalized
+            running = self._running
+            client = self._relay_client
+            self._relay_client = None
+            self._remote_connected = False
+            self._remote_error = ""
+        if changed and client is not None:
+            client.stop()
+        elif client is not None:
+            with self._lock:
+                self._relay_client = client
+            return
+        if running and normalized:
+            self._start_relay()
+        self._notify_status()
+
+    def remote_pairing_payload(self) -> dict[str, str]:
+        with self._lock:
+            relay_url = self._relay_url
+            running = self._running
+        if not relay_url or not running:
+            return {}
+        return {
+            "relay_url": relay_url,
+            "remote_token": self.remote_token,
+        }
+
     def _persist_code(self, code: str) -> None:
         protected = protect_password(code)
         if not protected:
@@ -350,8 +438,11 @@ class AiraMobileBridge:
     def reset_code(self) -> str:
         code = f"{secrets.randbelow(100_000_000):08d}"
         self._persist_code(code)
+        remote_token = secrets.token_urlsafe(32)
+        self._persist_remote_token(remote_token)
         with self._lock:
             self._code = code
+            self._remote_token = remote_token
             self._cached_auth_key = b""
             self._cached_auth_code = ""
             self._cached_auth_computer_id = ""
@@ -360,6 +451,14 @@ class AiraMobileBridge:
             self._last_seen = 0.0
             self._auth_failures.clear()
             self._auth_blocked_until.clear()
+            relay_url = self._relay_url
+            relay_client = self._relay_client
+            self._relay_client = None
+            running = self._running
+        if relay_client is not None:
+            relay_client.stop()
+        if running and relay_url:
+            self._start_relay()
         self._notify_status()
         return code
 
@@ -390,6 +489,72 @@ class AiraMobileBridge:
             )
             self._thread.start()
             self._start_discovery()
+            relay_enabled = bool(self._relay_url)
+        if relay_enabled:
+            self._start_relay()
+        self._notify_status()
+
+    def _start_relay(self) -> None:
+        with self._lock:
+            if not self._running or not self._relay_url or self._relay_client is not None:
+                return
+            client = AiraRelayClient(
+                self._relay_url,
+                self.computer_id,
+                self.remote_token,
+                self._handle_relay_session,
+                status_callback=self._relay_status_changed,
+            )
+            self._relay_client = client
+        client.start()
+
+    def _relay_status_changed(self, connected: bool, error: str) -> None:
+        with self._lock:
+            self._remote_connected = bool(connected)
+            self._remote_error = str(error or "")
+        self._notify_status()
+
+    def _handle_relay_session(
+        self,
+        relay: AiraRelayClient,
+        opened: dict[str, Any],
+    ) -> None:
+        session_id = str(opened.get("session_id") or "")
+        hello = opened.get("payload")
+        if not session_id or not isinstance(hello, dict):
+            raise ValueError("公网中继会话无效。")
+        server_side, relay_side = socket.socketpair()
+        server_side.settimeout(20.0)
+        relay_side.settimeout(20.0)
+        worker = threading.Thread(
+            target=self._handle_client,
+            args=(server_side, ("127.0.0.1", 0), self.remote_token),
+            daemon=True,
+            name="Passer-Aira-Relay-Session",
+        )
+        worker.start()
+        try:
+            _send_json(relay_side, hello)
+            challenge_raw = _recv_line(relay_side)
+            if not challenge_raw:
+                raise OSError("Passer 没有生成远程认证挑战。")
+            challenge = json.loads(challenge_raw.decode("utf-8"))
+            response = relay.exchange(session_id, challenge)
+            _send_json(relay_side, response)
+            final_raw = _recv_line(relay_side)
+            if not final_raw:
+                raise OSError("Passer 没有生成远程执行结果。")
+            final = json.loads(final_raw.decode("utf-8"))
+            relay.finish(session_id, final)
+            with self._lock:
+                self._last_ip = "公网中继"
+                self._last_seen = time.time()
+        finally:
+            try:
+                relay_side.close()
+            except OSError:
+                pass
+            worker.join(timeout=1.0)
         self._notify_status()
 
     def _base_auth_key(self) -> bytes:
@@ -435,6 +600,9 @@ class AiraMobileBridge:
             self._server = None
             discovery = self._discovery_socket
             self._discovery_socket = None
+            relay_client = self._relay_client
+            self._relay_client = None
+            self._remote_connected = False
         if server is not None:
             try:
                 server.shutdown(socket.SHUT_RDWR)
@@ -449,6 +617,8 @@ class AiraMobileBridge:
                 discovery.close()
             except OSError:
                 pass
+        if relay_client is not None:
+            relay_client.stop()
         self._notify_status()
 
     close = stop
@@ -469,6 +639,10 @@ class AiraMobileBridge:
                 "discovery_port": self.discovery_port,
                 "discovery_available": self._discovery_socket is not None,
                 "discovery_error": self._discovery_error,
+                "relay_url": self._relay_url,
+                "remote_configured": bool(self._relay_url),
+                "remote_connected": self._remote_connected,
+                "remote_error": self._remote_error,
                 "allowed_actions": list(PHONE_CONTROL_ACTIONS),
             }
 
@@ -478,14 +652,21 @@ class AiraMobileBridge:
             detail = str(state["last_error"] or "")
             return f"未启用{f' · {detail}' if detail else ' · 开启后可让同一 Wi-Fi 的手机连接'}"
         endpoint = f"{state['ip']}:{state['port']}"
+        if state["remote_connected"]:
+            remote = " · 公网中继在线"
+        elif state["remote_configured"]:
+            error = str(state["remote_error"] or "正在连接")[:55]
+            remote = f" · 公网中继：{error}"
+        else:
+            remote = " · 未配置公网中继"
         device = str(state["last_device"] or "")
         if device:
             return (
                 f"已连接 {device}（{state['last_ip']}） · "
-                f"{endpoint} · 连接码 {state['code']}"
+                f"{endpoint} · 连接码 {state['code']}{remote}"
             )
         discovery = "" if state["discovery_available"] else " · 自动发现不可用"
-        return f"等待手机连接 · {endpoint} · 连接码 {state['code']}{discovery}"
+        return f"等待手机连接 · {endpoint} · 连接码 {state['code']}{discovery}{remote}"
 
     def _notify_status(self) -> None:
         if callable(self.status_callback):
@@ -646,7 +827,12 @@ class AiraMobileBridge:
             "response_ciphertext": ciphertext,
         })
 
-    def _handle_client(self, conn: socket.socket, address) -> None:
+    def _handle_client(
+        self,
+        conn: socket.socket,
+        address,
+        remote_token: str = "",
+    ) -> None:
         ip = str(address[0] if address else "")
         action = "authenticate"
         try:
@@ -721,6 +907,7 @@ class AiraMobileBridge:
                 "computer_id": computer_id,
                 "computer_name": self.computer_name,
                 "server_public_key": server_public_text,
+                "relay": bool(remote_token),
             })
             shared_secret = server_private.exchange(ec.ECDH(), client_public)
             transcript = protocol_transcript(
@@ -731,8 +918,13 @@ class AiraMobileBridge:
                 client_public_text,
                 server_public_text,
             )
+            if remote_token:
+                transcript += "|relay"
+            auth_key = self._base_auth_key()
+            if remote_token:
+                auth_key = derive_remote_auth_key(auth_key, remote_token)
             proof_key, request_key, response_key = derive_session_keys(
-                self._base_auth_key(),
+                auth_key,
                 shared_secret,
                 transcript,
             )

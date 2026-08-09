@@ -250,6 +250,63 @@ class SettingsHardeningTests(unittest.TestCase):
             self.assertTrue(settings["aira_mobile_enabled"])
             self.assertTrue(settings["openclaw_enabled"])
 
+    def test_external_interface_defaults_on_and_requires_aira(self):
+        class Root:
+            def winfo_width(self): return 900
+            def winfo_height(self): return 600
+            def winfo_x(self): return 10
+            def winfo_y(self): return 20
+
+        with tempfile.TemporaryDirectory() as folder:
+            root = Path(folder)
+            Passer.DATA_DIR = root
+            Passer.SETTINGS_FILE = root / "settings.json"
+
+            Passer.SETTINGS_FILE.write_text(
+                json.dumps({"ai_enabled": True}), encoding="utf-8"
+            )
+            self.assertTrue(
+                Passer.load_settings()["ai_external_interface_enabled"]
+            )
+
+            Passer.SETTINGS_FILE.write_text(
+                json.dumps({
+                    "ai_enabled": False,
+                    "ai_external_interface_enabled": True,
+                }),
+                encoding="utf-8",
+            )
+            self.assertFalse(
+                Passer.load_settings()["ai_external_interface_enabled"]
+            )
+
+            Passer.save_settings(
+                Root(),
+                True,
+                ai_enabled=True,
+                ai_external_interface_enabled=False,
+            )
+            self.assertFalse(
+                Passer.load_settings()["ai_external_interface_enabled"]
+            )
+
+            Passer.save_settings(
+                Root(),
+                True,
+                ai_enabled=False,
+                ai_external_interface_enabled=True,
+            )
+            raw = json.loads(Passer.SETTINGS_FILE.read_text(encoding="utf-8"))
+            self.assertFalse(raw["ai_external_interface_enabled"])
+
+    def test_external_interface_row_is_directly_below_aira(self):
+        source = Path(Passer.__file__).read_text(encoding="utf-8")
+        aira_row = source.index('text="启用 Aira"')
+        external_row = source.index('text="启用外置接口"')
+        prompt_cache_row = source.index('text="提示缓存"')
+        self.assertLess(aira_row, external_row)
+        self.assertLess(external_row, prompt_cache_row)
+
     def test_json_transaction_rolls_back_every_file(self):
         with tempfile.TemporaryDirectory() as folder:
             root = Path(folder)
@@ -366,7 +423,7 @@ class PackagingHardeningTests(unittest.TestCase):
         self.assertIn("exclude_binaries=True", spec)
         self.assertIn('contents_directory="PasserRuntime"', spec)
         self.assertIn("coll = COLLECT(", spec)
-        self.assertIn('name="."', spec)
+        self.assertIn('name="Passer"', spec)
         self.assertNotIn("runtime_tmpdir=", spec)
 
 

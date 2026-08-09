@@ -214,6 +214,7 @@ class OpenClawBridgeTests(unittest.TestCase):
         app._instance_server = listener
         app._instance_queue = queue.Queue()
         app.openclaw_enabled = True
+        app.ai_external_interface_enabled = True
         app._openclaw_bridge_token = "good-token-" + ("x" * 32)
         worker = threading.Thread(target=app._accept_instance_pings, daemon=True)
         worker.start()
@@ -235,6 +236,7 @@ class OpenClawBridgeTests(unittest.TestCase):
     def test_passer_host_rejects_unknown_actions(self):
         app = Passer.RelayDockApp.__new__(Passer.RelayDockApp)
         app.openclaw_enabled = True
+        app.ai_external_interface_enabled = True
         app.items = [object(), object()]
         app.root = type("Root", (), {"winfo_viewable": lambda self: 1})()
         app.ai_enabled_var = type("Value", (), {"get": lambda self: True})()
@@ -242,10 +244,15 @@ class OpenClawBridgeTests(unittest.TestCase):
         app.summon_window = lambda: None
         status = app._dispatch_openclaw_request("status", {})
         self.assertEqual(status["items"], 2)
+        self.assertTrue(status["external_interface_enabled"])
         opened = app._dispatch_openclaw_request("open_item", {"query": "文档"})
         self.assertEqual(opened["messages"], ["ran:open_item"])
         with self.assertRaises(PermissionError):
             app._dispatch_openclaw_request("delete_mod", {"query": "demo"})
+        app.ai_external_interface_enabled = False
+        with self.assertRaisesRegex(PermissionError, "启用外置接口"):
+            app._dispatch_openclaw_request("status", {})
+        app.ai_external_interface_enabled = True
         app.openclaw_enabled = False
         with self.assertRaises(PermissionError):
             app._dispatch_openclaw_request("status", {})
@@ -256,10 +263,12 @@ class OpenClawBridgeTests(unittest.TestCase):
         app.items = [object()]
         app.root = type("Root", (), {"winfo_viewable": lambda self: 1})()
         app.ai_enabled_var = type("Value", (), {"get": lambda self: True})()
+        app.ai_external_interface_enabled = False
         app.execute_ai_actions = lambda actions: [f"ran:{actions[0]['action']}"]
         app.summon_window = lambda: None
         status = app._dispatch_aira_mobile_request("status", {})
         self.assertNotIn("add_target", status["allowed_actions"])
+        self.assertFalse(status["external_interface_enabled"])
         opened = app._dispatch_aira_mobile_request("open_tool", {"tool": "计算器"})
         self.assertEqual(opened["messages"], ["ran:open_tool"])
         with self.assertRaises(PermissionError):
@@ -275,6 +284,7 @@ class OpenClawBridgeTests(unittest.TestCase):
         app.automations = []
         app.root = type("Root", (), {"winfo_viewable": lambda self: 1})()
         app.ai_enabled_var = type("Value", (), {"get": lambda self: True})()
+        app.ai_external_interface_enabled = True
         app.aira_service = None
         app.save_automations = mock.Mock()
         app._refresh_automation_window = mock.Mock()
@@ -297,7 +307,7 @@ class OpenClawBridgeTests(unittest.TestCase):
         listed = app._dispatch_aira_mobile_request("list_tasks", {})
         self.assertEqual(listed["count"], 1)
         self.assertEqual(listed["active_count"], 1)
-        self.assertEqual(listed["refresh_after_ms"], 2500)
+        self.assertEqual(listed["refresh_after_ms"], 5000)
         self.assertEqual(listed["tasks"][0]["title"], "手机创建的任务")
         self.assertTrue(listed["tasks"][0]["running"])
         self.assertEqual(listed["tasks"][0]["run_round"], 2)
@@ -312,6 +322,20 @@ class OpenClawBridgeTests(unittest.TestCase):
         app.save_automations.assert_called_once()
         with self.assertRaises(PermissionError):
             app._dispatch_aira_mobile_request("delete_task", {"id": "anything"})
+
+    def test_aira_mobile_model_task_requires_external_interface(self):
+        app = Passer.RelayDockApp.__new__(Passer.RelayDockApp)
+        app.settings = {"aira_mobile_enabled": True}
+        app.ai_enabled_var = type("Value", (), {"get": lambda self: True})()
+        app.ai_external_interface_enabled = False
+
+        with self.assertRaisesRegex(PermissionError, "启用外置接口"):
+            app._dispatch_aira_mobile_request("add_task", {
+                "title": "手机任务",
+                "prompt": "调用 Passer 模型处理内容",
+                "mode": "once",
+                "when": "2099-01-02 09:30",
+            })
 
     def test_openclaw_registry_definition_can_be_disabled(self):
         commands = []
