@@ -121,16 +121,6 @@ python Passer.py
 - “手机 Aira → 远程设置”可填写自建的 HTTPS 中继。Passer 和手机都只建立出站连接，无需公网 IP 或端口映射。中继只接收由 256 位远程令牌派生的匿名路由凭据，原始令牌不会发送给中继；远程令牌同时参与端到端密钥派生，因此中继无法解密动作、参数和结果。中继仍能看到 IP、连接时间和电脑 ID 等必要元数据。
 - 可部署的中继程序、Caddy HTTPS 示例和本机测试方法位于 `relay/`。首次开通远程能力仍需在同一局域网执行一次手机“连接测试”，让手机通过现有加密链路取得中继地址和随机令牌。
 
-### OpenClaw 与微信控制
-
-- `设置 → Aira 模型 → 启用 OpenClaw` 会创建本机随机令牌，并把 Passer 的 MCP 桥注册到已安装的 OpenClaw。关闭开关会删除令牌并停用该桥；设置同步和 MCP 缓存刷新在后台执行，不占用启动动画，也不会重启整个 Gateway。
-- Aira 内置工具新增“OpenClaw 配置”一行；左侧“自动配置”会开启并保存本地桥、生成或复用令牌、注册 Passer MCP 并刷新 OpenClaw MCP 缓存。右侧“生成微信二维码”会打开 OpenClaw 微信扫码登录窗口，用于手机微信扫码和绑定。按钮会显示生成、完成或失败状态，并可重新配置/重试。
-- 开关只开放 `passer_control`，且 Passer 端会再次校验令牌和动作白名单。可用动作包括查询状态、唤起窗口、列出/搜索/选择/定位/打开现有项目、打开内置工具、载入用户明确给出的路径或网址、启动截图以及清除搜索；不开放 Shell、文件读取、删除、设置修改、邮件、浏览器控制或 MOD 操作。
-- 手机微信控制还需要 OpenClaw Gateway、腾讯微信插件 `@tencent-weixin/openclaw-weixin`、扫码登录和发送者配对。当前微信通道只支持私聊；仅打开 Passer 中的开关不会自动登录微信，也不会绕过 OpenClaw 的配对与权限限制。
-- 令牌保存在当前数据目录的 `PasserData\OpenClaw\bridge.token`。桥只连接 `127.0.0.1` 上正在运行的 Passer，不监听局域网端口；不要把令牌文件发送给他人。
-- `Passer.spec` 会为同一个 `Passer.exe` 保留 MCP 所需的重定向标准输入/输出，并在普通图形界面启动时提前隐藏自有控制台，因此不需要额外分发桥接 EXE。
-- GitHub Release 提供可直接运行的单文件 `Passer.exe`。单文件版启动时会解压到 `_MEI` 临时目录；开发者若优先考虑启动速度及避免临时目录清理警告，可直接运行 `pyinstaller Passer.spec --noconfirm` 构建 `dist\Passer\Passer.exe + PasserRuntime` 固定运行库版。设置环境变量 `PASSER_ONEFILE=1` 后执行同一命令即可构建 `dist\Passer.exe` 单文件版。
-
 ## 运行时 MOD Loader（EXE 发布后仍可扩展）
 
 - `Passer.exe` 是宿主，MOD 是宿主外的运行时代码，保存在当前数据目录的 `PasserData\Mods\<id>`。因此发布 EXE 后可以继续新增、编辑、禁用或删除 MOD，无需修改 EXE，也无需重新打包，思路与 Minecraft 的 Mod Loader 相同。
@@ -216,4 +206,3 @@ def teardown_mod(context):
 ```
 
 上面的 AI 动作会自动命名为 `mod.my_mod.echo`，避免不同 MOD 之间重名。
-
