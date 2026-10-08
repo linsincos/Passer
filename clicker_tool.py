@@ -68,6 +68,31 @@ class ClickerTheme:
         return _TITLE_BUTTON_DERIVED.get(str(self.title_bg).lower(), ("#172235", "#223047"))[1]
 
 
+def minimize_frameless_window(window: tk.Misc) -> bool:
+    """Minimize an overrideredirect window without losing its custom frame."""
+    try:
+        window.overrideredirect(False)
+        window.update_idletasks()
+        window.iconify()
+        return True
+    except (tk.TclError, RuntimeError):
+        pass
+
+    if sys.platform == "win32":
+        try:
+            user32 = ctypes.windll.user32
+            hwnd = int(user32.GetAncestor(window.winfo_id(), 2) or window.winfo_id())
+            user32.ShowWindow(hwnd, 6)  # SW_MINIMIZE
+            return bool(user32.IsIconic(hwnd))
+        except Exception:
+            pass
+    try:
+        window.overrideredirect(True)
+    except (tk.TclError, RuntimeError):
+        pass
+    return False
+
+
 class ClickerWindow:
     CHROME_TOP = 46
     CHROME_BOTTOM = 16

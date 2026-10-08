@@ -28,6 +28,7 @@ from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 from cryptography.hazmat.primitives.kdf.hkdf import HKDF
 
 from aira_relay_client import AiraRelayClient, normalize_relay_url
+from aira_phone_files import AiraPhoneFileStore, PHONE_FILE_ACTIONS
 from device_lock_tool import protect_password, unprotect_password
 
 
@@ -36,8 +37,9 @@ DEFAULT_PORT = 50720
 DISCOVERY_PROTOCOL = "aira-passer-discovery-v1"
 DISCOVERY_PORT = 50721
 DISCOVERY_REQUEST = b"AIRA_PASSER_DISCOVER_V1\n"
-MAX_MESSAGE_BYTES = 64 * 1024
-MAX_PARAMS_BYTES = 32 * 1024
+MAX_MESSAGE_BYTES = 1024 * 1024
+MAX_CONTROL_PARAMS_BYTES = 32 * 1024
+MAX_FILE_PARAMS_BYTES = 700 * 1024
 PBKDF2_ROUNDS = 120_000
 NONCE_BYTES = 16
 AES_NONCE_BYTES = 12
@@ -48,8 +50,8 @@ AUTH_BLOCK_SECONDS = 300.0
 MAX_CONCURRENT_CLIENTS = 8
 
 # Phone Aira gets a narrower set than OpenClaw. It may list/create scheduled
-# Aira tasks, but cannot add a path/URL to Passer, change settings, operate
-# MODs, read files, delete tasks, or run a shell.
+# Aira tasks and the dedicated phone-share directory, but cannot add arbitrary
+# paths/URLs to Passer, change settings, operate MODs, delete tasks, or run a shell.
 PHONE_CONTROL_ACTIONS = (
     "status",
     "summon",
@@ -62,7 +64,7 @@ PHONE_CONTROL_ACTIONS = (
     "clear_search",
     "list_tasks",
     "add_task",
-)
+) + PHONE_FILE_ACTIONS
 
 
 def local_ipv4() -> str:
@@ -250,6 +252,7 @@ class AiraMobileBridge:
         port: int = DEFAULT_PORT,
         discovery_port: int = DISCOVERY_PORT,
         relay_url: str = "",
+        file_share_dir: str | os.PathLike | None = None,
     ) -> None:
         self.state_dir = Path(state_dir)
         self.action_handler = action_handler
@@ -258,6 +261,10 @@ class AiraMobileBridge:
         self.port = int(port)
         self.discovery_port = int(discovery_port)
         self._relay_url = normalize_relay_url(relay_url)
+        self.file_store = AiraPhoneFileStore(
+            file_share_dir if file_share_dir is not None
+            else self.state_dir.parent / "PhoneFiles"
+        )
         self._lock = threading.RLock()
         self._server: socket.socket | None = None
         self._thread: threading.Thread | None = None
@@ -975,7 +982,8 @@ class AiraMobileBridge:
                     request_nonce,
                     request_ciphertext,
                 )
-                if len(request_json.encode("utf-8")) > MAX_PARAMS_BYTES:
+                request_size = len(request_json.encode("utf-8"))
+                if request_size > MAX_FILE_PARAMS_BYTES:
                     raise ValueError("手机参数过大。")
                 request_value = json.loads(request_json)
             except (TypeError, ValueError) as exc:
@@ -984,6 +992,11 @@ class AiraMobileBridge:
                 raise ValueError("手机请求必须是 JSON 对象。")
             action = str(request_value.get("action") or "").strip().casefold()
             params = request_value.get("params")
+            if (
+                action not in PHONE_FILE_ACTIONS
+                and request_size > MAX_CONTROL_PARAMS_BYTES
+            ):
+                raise ValueError("手机控制参数过大。")
             if action not in PHONE_CONTROL_ACTIONS:
                 self._encrypted_result(
                     conn,
@@ -995,6 +1008,15 @@ class AiraMobileBridge:
                 return
             if not isinstance(params, dict):
                 raise ValueError("手机参数必须是 JSON 对象。")
+            if remote_token and action in PHONE_FILE_ACTIONS:
+                self._encrypted_result(
+                    conn,
+                    proof_key=proof_key,
+                    response_key=response_key,
+                    transcript=transcript,
+                    envelope={"ok": False, "error": "文件共享仅支持同一局域网直连。"},
+                )
+                return
 
             with self._lock:
                 self._last_device = device_name or "Aira 手机"
@@ -1004,7 +1026,10 @@ class AiraMobileBridge:
             self._notify_status()
 
             try:
-                result = self.action_handler(action, params)
+                if action in PHONE_FILE_ACTIONS:
+                    result = self.file_store.execute(action, params, device_id)
+                else:
+                    result = self.action_handler(action, params)
                 envelope = {"ok": True, "result": result}
             except (OSError, PermissionError, RuntimeError, TimeoutError, TypeError, ValueError) as exc:
                 envelope = {"ok": False, "error": str(exc)}

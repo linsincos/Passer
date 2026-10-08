@@ -23,7 +23,7 @@ from pathlib import Path
 from tkinter import filedialog, messagebox, ttk
 from typing import Callable
 
-from clicker_tool import ClickerTheme
+from clicker_tool import ClickerTheme, minimize_frameless_window
 
 try:
     import win32cred
@@ -1028,6 +1028,8 @@ class MailWindow:
         self.theme = theme
         self.closed = False
         self.move_start = None
+        self._minimize_in_progress = False
+        self._frame_restore_after_id = None
         self.accounts: list[MailAccount] = self._load_accounts()
         self.account_by_label: dict[str, MailAccount] = {}
         self.folders: list[MailFolder] = []
@@ -1065,6 +1067,7 @@ class MailWindow:
         self.show_message_list()
 
         self.window.bind("<Escape>", lambda _event: self.close())
+        self.window.bind("<Map>", self._restore_custom_frame, add="+")
         self.window.protocol("WM_DELETE_WINDOW", self.close)
         self.search_var.trace_add("write", lambda *_args: self._render_messages())
         self._place_on_passer()
@@ -2118,9 +2121,57 @@ class MailWindow:
         self._async("测试账户", work, callback, lambda message: callback("测试失败：" + message))
 
     def minimize(self) -> None:
+        if self._minimize_in_progress:
+            return
+        self._minimize_in_progress = True
+        if self._frame_restore_after_id is not None:
+            try:
+                self.window.after_cancel(self._frame_restore_after_id)
+            except (tk.TclError, RuntimeError):
+                pass
+            self._frame_restore_after_id = None
+        manager = getattr(self.app, "focus_manager", None)
+        if manager is not None:
+            manager.cancel_pending(self.window)
+        minimize_frameless_window(self.window)
+
+        def finish_transition() -> None:
+            self._minimize_in_progress = False
+            try:
+                if self.window.state() == "normal":
+                    self._restore_custom_frame()
+            except (tk.TclError, RuntimeError):
+                pass
+
         try:
-            self.window.withdraw()
-        except tk.TclError:
+            self.window.after(140, finish_transition)
+        except (tk.TclError, RuntimeError):
+            finish_transition()
+
+    def _restore_custom_frame(self, event=None) -> None:
+        if getattr(event, "widget", self.window) is not self.window:
+            return
+        if self._minimize_in_progress:
+            return
+        if self._frame_restore_after_id is not None:
+            try:
+                self.window.after_cancel(self._frame_restore_after_id)
+            except (tk.TclError, RuntimeError):
+                pass
+
+        def restore() -> None:
+            self._frame_restore_after_id = None
+            if self._minimize_in_progress:
+                return
+            try:
+                if self.window.state() == "normal":
+                    self.window.overrideredirect(True)
+            except (tk.TclError, RuntimeError):
+                pass
+
+        try:
+            self._frame_restore_after_id = self.window.after(35, restore)
+        except (tk.TclError, RuntimeError):
             pass
 
     def show(self) -> None:
@@ -2128,6 +2179,7 @@ class MailWindow:
             self.window.deiconify()
             self.window.lift()
             self.window.focus_force()
+            self._restore_custom_frame()
         except tk.TclError:
             pass
 

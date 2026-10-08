@@ -59,7 +59,8 @@ def _numeric_names(mode: str) -> dict:
         "asin": inv(math.asin), "acos": inv(math.acos), "atan": inv(math.atan),
         "sinh": math.sinh, "cosh": math.cosh, "tanh": math.tanh,
         "ln": math.log, "log": math.log10, "log2": math.log2,
-        "sqrt": math.sqrt, "exp": math.exp, "abs": abs, "fact": math.factorial,
+        "sqrt": math.sqrt, "root": lambda index, value: value ** (1 / index),
+        "exp": math.exp, "abs": abs, "fact": math.factorial,
         "gcd": math.gcd, "round": round, "pow": pow, "min": min, "max": max,
     }
 
@@ -284,7 +285,8 @@ def _sympy_names(sp, mode: str, variables: dict | None = None) -> dict:
     names = {
         "x": x, "y": y, "z": z, "t": t, "n": n,
         "pi": sp.pi, "e": sp.E, "E": sp.E, "I": sp.I, "i": sp.I, "oo": sp.oo,
-        "sqrt": sp.sqrt, "exp": sp.exp, "ln": sp.log,
+        "sqrt": sp.sqrt, "root": lambda index, value: sp.root(value, index),
+        "exp": sp.exp, "ln": sp.log,
         "log": lambda a, b=10: sp.log(a, b), "log2": lambda a: sp.log(a, 2),
         "abs": sp.Abs, "Abs": sp.Abs, "factorial": sp.factorial,
         "gcd": sp.gcd, "lcm": sp.lcm, "binomial": sp.binomial, "nCr": sp.binomial,
@@ -734,7 +736,7 @@ class CalculatorWindow:
     FUNCTION_ROWS = {
         "COMP": [
             # 自然书写模板（占位框 □，按 Tab 跳到下一个框）：分数/根号/对数/定积分/求导。
-            [("▢/▢", "tmplsel", "□/□"), ("ⁿ√▢", "tmplsel", "(□)^(1/(□))"),
+            [("▢/▢", "tmplsel", "(□)/(□)"), ("ⁿ√▢", "tmplsel", "root(□,□)"),
              ("∛▢", "tmplsel", "(□)^(1/3)"), ("logₐb", "tmplsel", "log_□(□)"),
              ("∫ₐᵇ", "tmplsel", "∫_□^□(□)d[x]"), ("d/dx|ₐ", "tmplsel", "d/d[x](□)|x=□"),
              ("√▢", "tmplsel", "√(□)"), ("|▢|", "tmplsel", "|□|")],
@@ -815,7 +817,7 @@ class CalculatorWindow:
             [("A:B=X:C", "tmplsel", "ratioL(□,□,□)"),
              ("A:B=C:X", "tmplsel", "ratioR(□,□,□)"),
              (":", "ins", ","), ("x", "ins", "x"), ("%", "tmplsel", "(□)/100"),
-             ("分数", "tmplsel", "□/□"), ("S⇔D", "ins", ""), ("Ans", "ans", None)],
+             ("分数", "tmplsel", "(□)/(□)"), ("S⇔D", "ins", ""), ("Ans", "ans", None)],
         ],
         "CURR": [
             [("USD→CNY", "currency", ("USD", "CNY")), ("CNY→USD", "currency", ("CNY", "USD")),
@@ -860,6 +862,7 @@ class CalculatorWindow:
         self._selection = None
         self._caret_on = True          # 闪动光标当前是否可见
         self._blink_after = None
+        self._math_scroll_x = 0.0
         self.expression_var = tk.StringVar(value="")
         self.result_var = tk.StringVar(value="0")
 
@@ -962,15 +965,14 @@ class CalculatorWindow:
         keys = tk.Frame(body, bg="#171b25")
         keys.pack(fill=tk.BOTH, expand=True, padx=20, pady=(0, 12))
 
-        # SHIFT / ALPHA / REPLAY / MENU / ON——与真机同样的顶部控制区。
+        # SHIFT / ALPHA / 四向 REPLAY / MENU / ON——与真机同样的顶部控制区。
         top = tk.Frame(keys, bg="#171b25")
         top.pack(fill=tk.X, pady=(0, 5))
         self.shift_button = self._physical_key(top, "SHIFT", self.toggle_shift, fg="#f4c542", compact=True)
         self.shift_button.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=3)
         self.alpha_button = self._physical_key(top, "ALPHA", self.toggle_alpha, fg="#ef6b76", compact=True)
         self.alpha_button.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=3)
-        self._physical_key(top, "REPLAY\n◀ ▲ ▼ ▶", lambda: self.recall_history(-1), compact=True).pack(
-            side=tk.LEFT, fill=tk.X, expand=True, padx=3)
+        self._build_replay_pad(top).pack(side=tk.LEFT, fill=tk.X, expand=True, padx=3)
         self._physical_key(top, "MENU", self.open_menu_key, compact=True).pack(
             side=tk.LEFT, fill=tk.X, expand=True, padx=3)
         self._physical_key(top, "ON", self._power_on, compact=True).pack(
@@ -980,8 +982,8 @@ class CalculatorWindow:
         sci.pack(fill=tk.BOTH, expand=True)
         scientific_rows = [
             [("OPTN", self.open_option_menu, ""), ("CALC", self.evaluate, "SOLVE"),
-             ("∫", lambda: self._press_key("tmplsel", "∫□d[x]"), "d/dx"),
-             ("□/□", lambda: self._press_key("tmplsel", "□/□"), "a b/c"),
+             ("∫", self._calculus_key, "d/dx"),
+             ("□/□", lambda: self._press_key("tmplsel", "(□)/(□)"), "a b/c"),
              ("√", lambda: self._press_key("tmplsel", "√(□)"), "x²"),
              ("x²", lambda: self._press_key("ins", "²"), "√")],
             [("x□", lambda: self._power_key("F"), "ⁿ√"),
@@ -996,9 +998,9 @@ class CalculatorWindow:
              ("RCL", lambda: self._memory_key_action("recall", "D"), "STO"),
              ("STO", lambda: self._memory_key_action("store", "E"), "M−"),
              ("ENG", lambda: self._memory_key_action("eng", "F"), "←")],
-            [("sinh", lambda: self._press_key("ins", "sinh("), "sinh⁻¹"),
-             ("cosh", lambda: self._press_key("ins", "cosh("), "cosh⁻¹"),
-             ("tanh", lambda: self._press_key("ins", "tanh("), "tanh⁻¹"),
+            [("sinh", lambda: self._press_key("tmplsel", "sinh(□)"), "sinh⁻¹"),
+             ("cosh", lambda: self._press_key("tmplsel", "cosh(□)"), "cosh⁻¹"),
+             ("tanh", lambda: self._press_key("tmplsel", "tanh(□)"), "tanh⁻¹"),
              ("Pol", lambda: self._press_key("tmplsel", "Pol(□,□)"), "Rec"),
              ("Rec", lambda: self._press_key("tmplsel", "Rec(□,□)"), "Pol"),
              ("x!", lambda: self._press_key("ins", "!"), "Abs")],
@@ -1066,6 +1068,45 @@ class CalculatorWindow:
             padx=5, pady=(3 if compact else 7), highlightthickness=1,
             highlightbackground="#0b0d12",
         )
+
+    def _build_replay_pad(self, parent) -> tk.Frame:
+        """Build a real four-way REPLAY pad instead of one text-only key."""
+        pad = tk.Frame(
+            parent, bg="#343b48", height=58,
+            highlightthickness=1, highlightbackground="#0b0d12",
+        )
+        pad.pack_propagate(False)
+        tk.Label(
+            pad, text="REPLAY", bg="#343b48", fg="#f8fafc",
+            font=self._font(7, "bold"), pady=0,
+        ).pack(side=tk.TOP, fill=tk.X)
+
+        arrows = tk.Frame(pad, bg="#343b48")
+        arrows.pack(side=tk.TOP, fill=tk.BOTH, expand=True, padx=5, pady=(0, 3))
+        for column in range(3):
+            arrows.grid_columnconfigure(column, weight=1, uniform="replay")
+        for row in range(2):
+            arrows.grid_rowconfigure(row, weight=1, uniform="replay")
+
+        specs = (
+            ("▲", "up", 0, 1),
+            ("◀", "left", 1, 0),
+            ("▼", "down", 1, 1),
+            ("▶", "right", 1, 2),
+        )
+        self.replay_buttons = {}
+        for label, direction, row, column in specs:
+            button = tk.Button(
+                arrows, text=label,
+                command=lambda value=direction: self._navigate_replay(value),
+                bd=0, relief=tk.FLAT, bg="#343b48", fg="#ffffff",
+                activebackground="#566170", activeforeground="#ffffff",
+                cursor="hand2", font=self._font(7, "bold"), padx=0, pady=0,
+                highlightthickness=0,
+            )
+            button.grid(row=row, column=column, sticky="nsew", padx=1, pady=0)
+            self.replay_buttons[direction] = button
+        return pad
 
     def _dual_key(self, parent, row, column, primary, command, secondary="") -> None:
         cell = tk.Frame(parent, bg="#171b25")
@@ -1158,12 +1199,12 @@ class CalculatorWindow:
             self._insert(alpha_key)
         elif self.shift_active:
             shifted = {
-                "sin": "sin⁻¹(", "cos": "cos⁻¹(", "tan": "tan⁻¹(",
-                "log": "10^(", "ln": "e^(",
-            }.get(name, name + "(")
-            self._insert(shifted)
+                "sin": "sin⁻¹(□)", "cos": "cos⁻¹(□)", "tan": "tan⁻¹(□)",
+                "log": "10^(□)", "ln": "e^(□)",
+            }.get(name, name + "(□)")
+            self._insert_template(shifted)
         else:
-            self._insert(name + "(")
+            self._insert_template(name + "(□)")
         self._clear_modifiers()
 
     def _power_key(self, alpha_key: str = "F") -> None:
@@ -1171,9 +1212,17 @@ class CalculatorWindow:
             self.memory_key = alpha_key
             self._insert(alpha_key)
         elif self.shift_active:
-            self._insert_template("(□)^(1/(□))")
+            self._insert_template("root(□,□)")
         else:
-            self._insert("^")
+            self._insert_template("^(□)")
+        self._clear_modifiers()
+
+    def _calculus_key(self) -> None:
+        """Use the fx-991CN X two-dimensional calculus templates."""
+        if self.shift_active:
+            self._insert_template("d/d[x](□)|x=□")
+        else:
+            self._insert_template("∫_□^□(□)d[x]")
         self._clear_modifiers()
 
     def _memory_key_action(self, action: str, alpha_key: str) -> None:
@@ -1477,13 +1526,34 @@ class CalculatorWindow:
         text = self.expression_var.get()
         if event is not None and text:
             index = math_render.caret_index_at(
-                self.math_canvas, text, event.x,
-                base_size=self.DISPLAY_BASE_SIZE, pad=12, placeholder=" ")
+                self.math_canvas, text, event.x, event.y,
+                base_size=self.DISPLAY_BASE_SIZE, pad=12, placeholder=" ",
+                align="left", scroll_x=self._math_scroll_x, fit_width=False)
             self.display.icursor(index)
         else:
             self.display.icursor(tk.END)
         self.display.focus_set()
         return "break"
+
+    def _navigate_replay(self, direction: str, *, select: bool = False) -> None:
+        """Apply one physical/keyboard REPLAY direction to the 2D editor."""
+        if direction in ("left", "right"):
+            self._move_cursor(-1 if direction == "left" else 1, select=select)
+            self.display.focus_set()
+            return
+
+        vertical = -1 if direction == "up" else 1
+        target = math_render.move_caret_2d(
+            self.math_canvas, self.expression_var.get(), self._cursor, vertical,
+            base_size=self.DISPLAY_BASE_SIZE, pad=12, placeholder=" ",
+            align="left", scroll_x=self._math_scroll_x, fit_width=False,
+        )
+        if target != self._cursor:
+            self._set_cursor(target, select=select)
+        elif not select:
+            # 没有可进入的二维层级时，和 fx-991CN X 一样用上下键重放历史。
+            self.recall_history(vertical)
+        self.display.focus_set()
 
     def _handle_display_key(self, event):
         ctrl = bool(event.state & 0x4)
@@ -1501,8 +1571,11 @@ class CalculatorWindow:
         if key == "Delete":
             self._delete_forward()
             return "break"
-        if key in ("Left", "Right", "Up", "Down"):
-            # 已取消方向键移动光标：改用鼠标点击 LCD 定位光标。
+        if key in ("Left", "Right"):
+            self._navigate_replay(key.lower(), select=shift)
+            return "break"
+        if key in ("Up", "Down"):
+            self._navigate_replay(key.lower(), select=shift)
             return "break"
         if key == "Home":
             self._set_cursor(0, select=shift)
@@ -1727,13 +1800,18 @@ class CalculatorWindow:
                 # 这样光标“消失的一瞬间”不会再让整行左右跳动 / 留下空位。
                 shown = text[:self._cursor] + mark + text[self._cursor:]
                 caret_color = self.LCD_FG if self._caret_on else self.LCD_BG
-            math_render.render(
+            self._math_scroll_x = math_render.render(
                 self.math_canvas,
                 shown or " ",
                 base_size=self.DISPLAY_BASE_SIZE,
                 placeholder=" ",
                 fg=self.LCD_FG,
                 caret=caret_color,
+                align="left",
+                fit_width=False,
+                scroll_x=self._math_scroll_x,
+                focus_caret=True,
+                show_overflow=True,
             )
         except Exception:
             pass
@@ -1745,7 +1823,7 @@ class CalculatorWindow:
             text = text.replace("\n", "   ").removeprefix("= ").removeprefix("解：")
             math_render.render(
                 self.result_canvas, text, base_size=22, pad=8,
-                fg=self.LCD_FG, placeholder="0",
+                fg=self.LCD_FG, placeholder="0", align="right", fit_width=True,
             )
         except Exception:
             pass

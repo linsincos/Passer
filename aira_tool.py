@@ -754,6 +754,7 @@ class AiraService:
                 status_callback=self._publish_mobile_status,
                 unexpected_callback=self._log_mobile_unexpected,
                 relay_url=str(self.app.settings.get("aira_relay_url") or ""),
+                file_share_dir=self.data_dir / "PhoneFiles",
             )
         except ValueError:
             self.app.settings["aira_relay_url"] = ""
@@ -762,6 +763,7 @@ class AiraService:
                 self._dispatch_mobile_action,
                 status_callback=self._publish_mobile_status,
                 unexpected_callback=self._log_mobile_unexpected,
+                file_share_dir=self.data_dir / "PhoneFiles",
             )
         if bool(self.app.settings.get("aira_usage_reminder_enabled", False)):
             self.usage_reminder.start()
@@ -887,6 +889,15 @@ class AiraService:
 
     def configure_mobile_relay(self, relay_url: str) -> None:
         self.mobile_bridge.configure_relay(relay_url)
+
+    def open_mobile_share_folder(self) -> Path:
+        folder = self.mobile_bridge.file_store.folder
+        folder.mkdir(parents=True, exist_ok=True)
+        starter = getattr(os, "startfile", None)
+        if not callable(starter):
+            raise OSError("当前系统不支持直接打开共享文件夹。")
+        starter(str(folder))
+        return folder
 
     def _dispatch_mobile_action(self, action: str, params: dict) -> dict:
         """Move a phone request onto Tk's UI thread and return its real result."""
@@ -1921,6 +1932,10 @@ class AiraWindow:
             mobile_row, "启用连接", self.toggle_mobile_bridge, primary=True,
         )
         self.mobile_button.pack(side=tk.RIGHT, padx=(8, 18), pady=16)
+        self.mobile_files_button = self._button(
+            mobile_row, "共享文件夹", self.open_mobile_share_folder,
+        )
+        self.mobile_files_button.pack(side=tk.RIGHT, padx=(8, 0), pady=16)
         self.mobile_relay_button = self._button(
             mobile_row, "远程设置", self.configure_mobile_relay,
         )
@@ -2232,6 +2247,13 @@ class AiraWindow:
         except (OSError, ValueError) as exc:
             messagebox.showerror("公网中继地址无效", str(exc), parent=self.window)
         self.refresh_mobile_status()
+
+    def open_mobile_share_folder(self) -> None:
+        try:
+            folder = self.service.open_mobile_share_folder()
+            self.app.write_status(f"已打开手机共享文件夹：{folder}")
+        except OSError as exc:
+            messagebox.showerror("无法打开共享文件夹", str(exc), parent=self.window)
 
     def refresh_mobile_status(self) -> None:
         running = self.service.mobile_running

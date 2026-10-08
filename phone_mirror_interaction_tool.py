@@ -2116,6 +2116,37 @@ class PhoneMirrorAdvancedWindow:
     def close(self) -> None:
         self.hide(notify_parent=True)
 
+    def shutdown(self, notify_parent: bool = False) -> None:
+        """Permanently close the advanced controller and its scrcpy process."""
+        if self.closed:
+            return
+        self.closed = True
+        try:
+            self.bridge_var.set(False)
+        except Exception:
+            pass
+        try:
+            self.tap_bridge.stop()
+        except Exception:
+            pass
+        try:
+            self.fast_shell.stop()
+        except Exception:
+            pass
+        try:
+            self.stop_scrcpy()
+        except Exception:
+            pass
+        try:
+            self.window.destroy()
+        except Exception:
+            pass
+        if notify_parent and self.on_close is not None:
+            try:
+                self.on_close()
+            except Exception:
+                pass
+
 
 class PasserSelect(tk.Frame):
     def __init__(
@@ -3336,14 +3367,42 @@ class PhoneMirrorWindow:
     def close(self) -> None:
         if self.closed:
             return
-        self._save_projection_settings()
-        self._stop_projection_dock_tracking(destroy=False)
-        if self.advanced_window is not None and not getattr(self.advanced_window, "closed", True):
-            self.advanced_window.hide(notify_parent=False)
+        # The close button must close the tool, not merely hide its controller
+        # while scrcpy continues running in the background.
+        self.closed = True
         try:
-            self.window.withdraw()
-            if self.scrcpy_process is not None and self.scrcpy_process.poll() is None:
-                self.status_var.set("控制窗口已隐藏，正在进行的投屏保持运行。")
+            self._save_projection_settings()
+        except Exception:
+            pass
+        try:
+            self.stop_projection()
+        except Exception:
+            pass
+        try:
+            self._stop_projection_dock_tracking(destroy=True)
+        except Exception:
+            pass
+
+        advanced = self.advanced_window
+        self.advanced_window = None
+        if advanced is not None and not getattr(advanced, "closed", True):
+            shutdown = getattr(advanced, "shutdown", None)
+            if callable(shutdown):
+                try:
+                    shutdown(notify_parent=False)
+                except Exception:
+                    pass
+            else:
+                try:
+                    advanced.stop_scrcpy()
+                except Exception:
+                    pass
+                try:
+                    advanced.window.destroy()
+                except Exception:
+                    pass
+        try:
+            self.window.destroy()
         except Exception:
             pass
 

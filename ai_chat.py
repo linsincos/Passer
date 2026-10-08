@@ -440,6 +440,7 @@ Passer 是一个本地桌面中转坞，可集中管理程序、文件、文件�
 - **计算器 Calculator**：支持安全表达式计算、常见单位换算和在线汇率换算。
 - **定时关机 Shutdown**：可选择指定时间关机或倒计时关机，设置前会二次确认，并支持取消 Windows 关机计划。对应内置工具目标 `passer://shutdown`，可用 `open_tool`（tool 填“定时关机”）打开窗口。
 - **网络检测 Network**：一个按钮自动检测下载速度、延迟和丢包率。
+- **剪贴板 Clipboard**：用户主动打开窗口后查看当前剪贴板及本次窗口内的历史，可编辑文本并写回、另存剪贴板图片或清空剪贴板；历史只留在内存，不写入磁盘。
 - **文件共享 File Share**：显示局域网 IP 和广域网 IP；校园网/局域网内点对点传文件/文件夹，支持自动发现和按需同网段直连探测，接收时需输入 4–8 位传输码。
 - **二维码 QR**：生成二维码图片并载入 Passer；识别二维码图片时会尝试调用本机 pyzbar/OpenCV。
 - **屏幕录制 Recorder**：框选屏幕区域录制，GIF 可直接保存，MP4 需要本机具备 imageio/ffmpeg 编码支持。
@@ -839,6 +840,7 @@ PASSER_SETTINGS_INSTRUCTIONS = """
 - Aira：`ai_enabled`、`ai_provider`、`ai_model`、`thinking_mode`（auto/enabled/disabled）、`reasoning`（auto/low/medium/high/max）、`persona`、`prompt_cache`。
 - 快捷键：`search_hotkey`、`ai_hotkey`。
 - 打开方式：`office_open_mode`、`folder_open_mode`、`code_open_mode`、`pdf_open_mode`、`image_open_mode`、`video_open_mode`、`audio_open_mode`。
+- 历史版本命名：`history_naming_mode`（time/version/custom）与 `history_naming_pattern`。自定义模板可使用 `{name}`、`{stem}`、`{ext}`、`{date}`、`{time}`、`{datetime}`、`{version}`；先与用户确认最终模板再写入。
 
 示例：
 [[PASSER_ACTION]]
@@ -5258,13 +5260,11 @@ class AIChatBar:
         dirty = set()
         delta_count = 0
         try:
-            while True:
+            # Stop before dequeuing the next item. Re-enqueuing an over-budget
+            # delta at the tail can move it behind 'done' or 'reconnecting'.
+            while delta_count < self._POLL_DELTA_LIMIT:
                 item = self._result_queue.get_nowait()
                 if item[0] == "delta":
-                    if delta_count >= self._POLL_DELTA_LIMIT:
-                        # 本帧 delta 已达上限，把这条放回队列，下帧继续处理
-                        self._result_queue.put(item)
-                        break
                     _, run_id, bubble, chunk = item
                     if self._is_stale_run(run_id):
                         continue

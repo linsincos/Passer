@@ -12,6 +12,24 @@ PROVIDERS = {
         "models": ["deepseek-chat", "deepseek-reasoner"],
         "kind": "openai",
     },
+    "talentsai": {
+        "name": "TalentsAI",
+        "endpoint": "https://llm-cn.humanlaya.com/v1/chat/completions",
+        "models_endpoint": "https://llm-cn.humanlaya.com/v1/models",
+        "model": "external-gpt-5.6-sol",
+        "models": [
+            "external-gpt-5.6-sol",
+            "external-claude-opus-4-8",
+            "anthropic/claude-opus-5",
+            "anthropic/claude-fable-5",
+        ],
+        "kind": "openai",
+        # TalentsAI documents reasoning_effort for its current model pool.  It
+        # does not document OpenAI's optional stream_options extension, so do
+        # not send that extra field through this compatibility gateway.
+        "reasoning_effort": True,
+        "stream_options": False,
+    },
     "claude": {
         "name": "Claude",
         "endpoint": "https://api.anthropic.com/v1/messages",
@@ -72,7 +90,7 @@ PROVIDERS = {
         "kind": "openai",
     },
 }
-PROVIDER_ORDER = ("deepseek", "claude", "gpt", "gemini", "grok", "qwen", "moonshot", "glm")
+PROVIDER_ORDER = ("deepseek", "talentsai", "claude", "gpt", "gemini", "grok", "qwen", "moonshot", "glm")
 NAME_TO_KEY = {cfg["name"]: key for key, cfg in PROVIDERS.items()}
 
 
@@ -178,6 +196,8 @@ def normalize_thinking_mode(mode: str | None) -> str:
 def model_supports_reasoning(provider_key: str, model: str | None) -> bool:
     """该模型是否支持可调“思考程度”（OpenAI reasoning_effort / Anthropic 扩展思考）。"""
     name = str(model or "")
+    if (PROVIDERS.get(provider_key) or {}).get("reasoning_effort"):
+        return bool(name)
     if provider_key == "deepseek":
         return name.startswith("deepseek-")
     if provider_key == "gpt":
@@ -198,9 +218,15 @@ def model_supports_thinking_mode(provider_key: str, model: str | None) -> bool:
     )
 
 
-def _reasoning_effort_for_provider(provider_key: str, effort: str) -> str:
+def _reasoning_effort_for_provider(provider_key: str, effort: str,
+                                   model: str | None = None) -> str:
     if provider_key == "deepseek":
         return "max" if effort == "max" else "high"
+    if provider_key == "talentsai" and effort == "max":
+        # The gateway documents xhigh only for part of its GPT family.  Keep
+        # Claude-compatible model ids on high so a shared setting cannot make
+        # those requests fail validation.
+        return "xhigh" if str(model or "").startswith("external-gpt-") else "high"
     return "high" if effort == "max" else effort
 
 
@@ -304,8 +330,12 @@ def _limit_llm_history_chars(messages: list[dict],
         content = str(message.get("content") or "")
         if not content:
             continue
+        # 短消息也必须完整保留。这个阈值只用于避免在总预算末尾塞入一小段
+        # 被截断的旧长消息，不能拿来过滤本来就很短的用户问题。
+        if len(content) > remaining and remaining < AI_CONTEXT_MIN_MESSAGE_CHARS:
+            break
         allowed = min(len(content), remaining)
-        if allowed < AI_CONTEXT_MIN_MESSAGE_CHARS:
+        if allowed <= 0:
             break
         if len(content) > allowed:
             content = _trim_llm_message_content(content, allowed)
@@ -313,7 +343,7 @@ def _limit_llm_history_chars(messages: list[dict],
                 content = content[:allowed].rstrip()
         kept_reversed.append({"role": message["role"], "content": content})
         remaining -= len(content)
-        if remaining < AI_CONTEXT_MIN_MESSAGE_CHARS:
+        if remaining <= 0:
             break
     return list(reversed(kept_reversed))
 
@@ -540,7 +570,7 @@ def call_llm(provider_key: str, api_key: str, history: list[dict],
             "max_tokens": AI_MAX_OUTPUT_TOKENS,
             "stream": stream,
         }
-        if stream:
+        if stream and cfg.get("stream_options", True):
             # 让最后一个数据块带上 usage，便于统计本轮 tokens。
             payload["stream_options"] = {"include_usage": True}
         if prompt_cache and provider_key == "gpt":
@@ -549,9 +579,9 @@ def call_llm(provider_key: str, api_key: str, history: list[dict],
             if explicit_mode:
                 payload["thinking"] = {"type": mode}
             if mode != "disabled" and explicit_effort:
-                payload["reasoning_effort"] = _reasoning_effort_for_provider(provider_id, effort)
+                payload["reasoning_effort"] = _reasoning_effort_for_provider(provider_id, effort, model_id)
         elif explicit_effort:
-            payload["reasoning_effort"] = _reasoning_effort_for_provider(provider_id, effort)
+            payload["reasoning_effort"] = _reasoning_effort_for_provider(provider_id, effort, model_id)
 
     data = json.dumps(payload).encode("utf-8")
     req = urllib.request.Request(cfg["endpoint"], data=data, headers=headers, method="POST")
@@ -628,7 +658,7 @@ def call_deepseek_max_context(
     if explicit_mode:
         payload["thinking"] = {"type": mode}
     if mode != "disabled" and explicit_effort:
-        payload["reasoning_effort"] = _reasoning_effort_for_provider("deepseek", effort)
+        payload["reasoning_effort"] = _reasoning_effort_for_provider("deepseek", effort, model_id)
 
     data = json.dumps(payload, ensure_ascii=False).encode("utf-8")
     req = urllib.request.Request(
@@ -679,6 +709,18 @@ def _stream_llm_response(req, timeout: int, kind: str, on_delta) -> tuple[str, d
                     obj = json.loads(data)
                 except json.JSONDecodeError:
                     continue
+                if not isinstance(obj, dict):
+                    continue
+                # Providers may start HTTP 200/SSE successfully and then fail.
+                # Never treat an in-stream error (even after text) as completion.
+                if obj.get("type") == "error" or obj.get("error") is not None:
+                    error = obj.get("error")
+                    if isinstance(error, dict):
+                        detail = error.get("message") or error.get("type") or error.get("code")
+                    else:
+                        detail = error
+                    detail = str(detail or obj.get("message") or "服务端返回了未说明原因的错误。")
+                    raise RuntimeError(f"模型流式响应错误：{detail}")
                 if kind == "anthropic":
                     etype = obj.get("type")
                     if etype == "content_block_delta":

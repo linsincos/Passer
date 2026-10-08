@@ -55,6 +55,7 @@ def _session(
     code: str,
     client_nonce: str,
     device_id: str,
+    remote_token: str = "",
 ):
     client_private = ec.generate_private_key(ec.SECP256R1())
     client_public_text = base64.b64encode(
@@ -84,8 +85,12 @@ def _session(
         client_public_text,
         challenge["server_public_key"],
     )
+    auth_key = derive_auth_key(code, challenge["computer_id"], challenge["rounds"])
+    if remote_token:
+        transcript += "|relay"
+        auth_key = derive_remote_auth_key(auth_key, remote_token)
     keys = derive_session_keys(
-        derive_auth_key(code, challenge["computer_id"], challenge["rounds"]),
+        auth_key,
         shared_secret,
         transcript,
     )
@@ -280,7 +285,91 @@ class AiraMobileBridgeTests(unittest.TestCase):
             self.assertTrue(first["pairing_required"])
             self.assertIn("list_tasks", PHONE_CONTROL_ACTIONS)
             self.assertIn("add_task", PHONE_CONTROL_ACTIONS)
+            self.assertIn("file_share_list", PHONE_CONTROL_ACTIONS)
             self.assertNotIn("delete_task", PHONE_CONTROL_ACTIONS)
+
+    def test_file_actions_do_not_reach_ui_dispatch(self):
+        calls = []
+        with tempfile.TemporaryDirectory() as folder:
+            bridge = AiraMobileBridge(
+                Path(folder) / "state",
+                lambda action, params: calls.append((action, params)) or {},
+                file_share_dir=Path(folder) / "shared",
+            )
+            result = bridge.file_store.execute("file_share_list", {}, "phone-one")
+            self.assertEqual(result["files"], [])
+            self.assertEqual(calls, [])
+
+    def test_encrypted_file_list_uses_store_on_lan(self):
+        calls = []
+        with tempfile.TemporaryDirectory() as folder:
+            shared = Path(folder) / "shared"
+            shared.mkdir()
+            (shared / "hello.txt").write_text("hello", encoding="utf-8")
+            bridge = AiraMobileBridge(
+                Path(folder) / "state",
+                lambda action, params: calls.append((action, params)) or {},
+                file_share_dir=shared,
+            )
+            bridge._code = "12345678"
+            server, client = socket.socketpair()
+            worker = threading.Thread(
+                target=bridge._handle_client,
+                args=(server, ("127.0.0.1", 50004)),
+                daemon=True,
+            )
+            worker.start()
+            nonce = "66" * 16
+            _challenge, transcript, keys = _session(
+                client, code="12345678", client_nonce=nonce, device_id="file-phone"
+            )
+            _send(client, _encrypted_request(
+                client_nonce=nonce,
+                transcript=transcript,
+                keys=keys,
+                action="file_share_list",
+                params={},
+            ))
+            result = _decrypted_response(_receive(client), transcript, keys)
+            self.assertTrue(result["ok"])
+            self.assertEqual(result["result"]["files"][0]["name"], "hello.txt")
+            self.assertEqual(calls, [])
+            client.close()
+            worker.join(timeout=2)
+
+    def test_file_actions_are_rejected_over_relay_transport(self):
+        token = "B" * 43
+        with tempfile.TemporaryDirectory() as folder:
+            bridge = AiraMobileBridge(Path(folder), lambda _action, _params: {})
+            bridge._code = "12345678"
+            server, client = socket.socketpair()
+            worker = threading.Thread(
+                target=bridge._handle_client,
+                args=(server, ("127.0.0.1", 0), token),
+                daemon=True,
+            )
+            worker.start()
+            nonce = "77" * 16
+            challenge, transcript, keys = _session(
+                client,
+                code="12345678",
+                client_nonce=nonce,
+                device_id="remote-file-phone",
+                remote_token=token,
+            )
+            self.assertTrue(challenge["relay"])
+            _send(client, _encrypted_request(
+                client_nonce=nonce,
+                transcript=transcript,
+                keys=keys,
+                action="file_share_list",
+                params={},
+            ))
+            result = _decrypted_response(_receive(client), transcript, keys)
+            self.assertFalse(result["ok"])
+            self.assertIn("局域网", result["error"])
+            client.close()
+            worker.join(timeout=2)
 
     def test_udp_discovery_returns_only_pairing_metadata(self):
         with tempfile.TemporaryDirectory() as folder:

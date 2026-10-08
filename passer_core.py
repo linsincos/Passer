@@ -7,6 +7,17 @@ def _load_symbol(module_name: str, symbol_name: str):
     return getattr(importlib.import_module(module_name), symbol_name)
 
 
+def make_path_writable(path: str | os.PathLike) -> Path:
+    """Clear a copied file's read-only bit without changing its source file."""
+    target = Path(path)
+    try:
+        mode = target.stat().st_mode
+    except FileNotFoundError:
+        return target
+    target.chmod(mode | stat.S_IWRITE)
+    return target
+
+
 def protect_password(value: str) -> str:
     return _load_symbol("device_lock_tool", "protect_password")(value)
 
@@ -910,6 +921,7 @@ class DockItem:
     group_id: str | None = None
     reminder_at: str | None = None
     mark_color: str | None = None
+    group_order: int | None = None
 
     @property
     def display_title(self) -> str:
@@ -928,6 +940,7 @@ BUILTIN_CALCULATOR_TARGET = "passer://calculator"
 BUILTIN_SHUTDOWN_TARGET = "passer://shutdown"
 BUILTIN_NETWORK_TARGET = "passer://network"
 BUILTIN_SERVER_TARGET = "passer://server"
+BUILTIN_CLIPBOARD_TARGET = "passer://clipboard"
 BUILTIN_MAIL_TARGET = "passer://mail"
 BUILTIN_QR_TARGET = "passer://qr"
 BUILTIN_MARKDOWN_TARGET = "passer://markdown"
@@ -955,6 +968,7 @@ BUILTIN_CALCULATOR_TITLE = "计算器 Calculator"
 BUILTIN_SHUTDOWN_TITLE = "定时关机 Shutdown"
 BUILTIN_NETWORK_TITLE = "网络检测 Network"
 BUILTIN_SERVER_TITLE = "服务器 Server"
+BUILTIN_CLIPBOARD_TITLE = "剪贴板 Clipboard"
 BUILTIN_MAIL_TITLE = "邮件 Mail"
 BUILTIN_QR_TITLE = "二维码 QR"
 BUILTIN_MARKDOWN_TITLE = "Markdown 预览器"
@@ -1032,6 +1046,16 @@ BUILTIN_TOOLS = (
         "aliases": (
             "服务器", "本地服务器", "静态服务器", "HTTP服务器", "网关",
             "server", "web server", "http server", "localhost", "gateway",
+        ),
+    },
+    {
+        "id": "__passer_builtin_clipboard__",
+        "target": BUILTIN_CLIPBOARD_TARGET,
+        "title": BUILTIN_CLIPBOARD_TITLE,
+        "detail": "内置工具",
+        "aliases": (
+            "剪贴板", "剪切板", "复制历史", "粘贴板", "clipboard",
+            "clipboard history", "copy history", "pasteboard",
         ),
     },
     {
@@ -1174,6 +1198,7 @@ BUILTIN_TOOL_ICON_STYLE = {
     BUILTIN_SHUTDOWN_TARGET: ("power", "#dc2626"),
     BUILTIN_NETWORK_TARGET: ("network", "#0284c7"),
     BUILTIN_SERVER_TARGET: ("network", "#0f766e"),
+    BUILTIN_CLIPBOARD_TARGET: ("clipboard", "#2563eb"),
     BUILTIN_MAIL_TARGET: ("mail", "#2563eb"),
     BUILTIN_QR_TARGET: ("qr", "#7c2d12"),
     BUILTIN_MARKDOWN_TARGET: ("document", "#334155"),
@@ -1765,6 +1790,12 @@ def builtin_tool_icon_image(target: str, size: int = 44) -> "Image.Image | None"
         ellipse((29, 28, 35, 34), 2, fill="white")
         line([(15, 22), (29, 13)], 2)
         line([(15, 22), (29, 31)], 2)
+    elif kind == "clipboard":
+        rect((11, 12, 33, 35), 2, 4)
+        rect((16, 9, 28, 15), 2, 3, fill=color)
+        line([(16, 21), (28, 21)], 2)
+        line([(16, 26), (28, 26)], 2)
+        line([(16, 31), (24, 31)], 2)
     elif kind == "mail":
         rect((9, 13, 35, 31), 2, 4)
         line([(10, 15), (22, 24), (34, 15)], 2)
@@ -2573,9 +2604,11 @@ def normalize_item(raw) -> DockItem | None:
     mark_color = str(mark_color).strip().lower() if mark_color is not None else None
     if mark_color not in ITEM_MARK_PALETTE:
         mark_color = None
+    group_order_raw = raw["group_order"] if "group_order" in raw else raw.get("GroupOrder")
+    group_order = normalize_grid_value(group_order_raw)
     return DockItem(
         str(item_id), kind, target, str(title), str(added_at),
-        grid_x, grid_y, passer_name, group_id, reminder_at, mark_color,
+        grid_x, grid_y, passer_name, group_id, reminder_at, mark_color, group_order,
     )
 
 
@@ -2606,6 +2639,244 @@ def load_items() -> list[DockItem]:
 
 def save_items(items: list[DockItem]) -> None:
     write_json(ITEMS_FILE, [asdict(item) for item in items])
+
+
+HISTORY_NAMING_TIME = "time"
+HISTORY_NAMING_VERSION = "version"
+HISTORY_NAMING_CUSTOM = "custom"
+HISTORY_NAMING_LABELS = {
+    HISTORY_NAMING_TIME: "时间",
+    HISTORY_NAMING_VERSION: "版本号",
+    HISTORY_NAMING_CUSTOM: "自定义",
+}
+HISTORY_NAMING_BY_LABEL = {label: key for key, label in HISTORY_NAMING_LABELS.items()}
+HISTORY_NAMING_OPTIONS = tuple(HISTORY_NAMING_BY_LABEL)
+DEFAULT_HISTORY_NAMING_PATTERN = "{stem}_{datetime}_v{version}{ext}"
+HISTORY_PATTERN_FIELDS = frozenset({"name", "stem", "ext", "date", "time", "datetime", "version"})
+HISTORY_SCHEMA_VERSION = 1
+
+
+def normalize_history_naming_mode(value) -> str:
+    raw = str(value or "").strip()
+    if raw in HISTORY_NAMING_LABELS:
+        return raw
+    if raw in HISTORY_NAMING_BY_LABEL:
+        return HISTORY_NAMING_BY_LABEL[raw]
+    aliases = {
+        "date": HISTORY_NAMING_TIME,
+        "datetime": HISTORY_NAMING_TIME,
+        "timestamp": HISTORY_NAMING_TIME,
+        "时间戳": HISTORY_NAMING_TIME,
+        "number": HISTORY_NAMING_VERSION,
+        "version_number": HISTORY_NAMING_VERSION,
+        "版本": HISTORY_NAMING_VERSION,
+        "自定义规则": HISTORY_NAMING_CUSTOM,
+    }
+    return aliases.get(raw.casefold(), HISTORY_NAMING_TIME)
+
+
+def normalize_history_naming_pattern(value) -> str:
+    pattern = str(value or "").strip()
+    return pattern[:160] or DEFAULT_HISTORY_NAMING_PATTERN
+
+
+def _history_pattern_fields(pattern: str) -> set[str]:
+    fields = set(re.findall(r"\{([^{}]+)\}", pattern))
+    stripped = re.sub(r"\{[^{}]+\}", "", pattern)
+    if "{" in stripped or "}" in stripped:
+        raise ValueError("自定义命名规则中的大括号不完整。")
+    unsupported = sorted(fields - HISTORY_PATTERN_FIELDS)
+    if unsupported:
+        raise ValueError(
+            "不支持的历史版本命名占位符：" + "、".join(unsupported)
+            + "。可用：" + "、".join(f"{{{name}}}" for name in sorted(HISTORY_PATTERN_FIELDS))
+        )
+    return fields
+
+
+def validate_history_naming_pattern(value) -> str:
+    pattern = normalize_history_naming_pattern(value)
+    _history_pattern_fields(pattern)
+    sample = {
+        "name": "示例.txt", "stem": "示例", "ext": ".txt",
+        "date": "20260813", "time": "093000", "datetime": "20260813_093000",
+        "version": "1",
+    }
+    try:
+        rendered = pattern.format_map(sample)
+    except (KeyError, ValueError) as exc:
+        raise ValueError(f"历史版本命名规则无效：{exc}") from exc
+    if not str(rendered).strip(" ."):
+        raise ValueError("历史版本命名规则不能生成空文件名。")
+    return pattern
+
+
+def history_versions_root() -> Path:
+    return DATA_DIR / "Versions"
+
+
+def history_index_file() -> Path:
+    return history_versions_root() / "history.json"
+
+
+def _safe_history_item_key(item_id: str) -> str:
+    raw = re.sub(r"[^A-Za-z0-9._-]+", "_", str(item_id or "").strip()).strip("._")
+    return raw[:80] or hashlib.sha256(str(item_id).encode("utf-8", "replace")).hexdigest()[:24]
+
+
+def history_item_directory(item_id: str) -> Path:
+    return history_versions_root() / _safe_history_item_key(item_id)
+
+
+def history_record_path(record: dict) -> Path | None:
+    if not isinstance(record, dict):
+        return None
+    raw = str(record.get("path") or "").strip()
+    if not raw:
+        return None
+    relative = Path(raw.replace("/", os.sep))
+    if relative.is_absolute():
+        return None
+    try:
+        candidate = (DATA_DIR / relative).resolve(strict=False)
+        root = history_versions_root().resolve(strict=False)
+        if os.path.commonpath((str(candidate), str(root))) != str(root):
+            return None
+    except (OSError, ValueError):
+        return None
+    return candidate
+
+
+def history_relative_path(path: Path) -> str:
+    resolved = Path(path).resolve(strict=False)
+    root = history_versions_root().resolve(strict=False)
+    try:
+        if os.path.commonpath((str(resolved), str(root))) != str(root):
+            raise ValueError("历史版本文件必须保存在 PasserData\\Versions 中。")
+        return resolved.relative_to(DATA_DIR.resolve(strict=False)).as_posix()
+    except (OSError, ValueError) as exc:
+        raise ValueError("历史版本路径不在 Passer 数据目录内。") from exc
+
+
+def load_version_history() -> dict[str, list[dict]]:
+    payload = read_json(history_index_file(), {})
+    if not isinstance(payload, dict):
+        return {}
+    raw_items = payload.get("items", payload)
+    if not isinstance(raw_items, dict):
+        return {}
+    result: dict[str, list[dict]] = {}
+    for raw_item_id, raw_records in raw_items.items():
+        item_id = str(raw_item_id or "").strip()
+        if not item_id or not isinstance(raw_records, list):
+            continue
+        records: list[dict] = []
+        for raw_record in raw_records:
+            if not isinstance(raw_record, dict):
+                continue
+            path = history_record_path(raw_record)
+            if path is None or not path.is_file():
+                continue
+            records.append({
+                "id": str(raw_record.get("id") or uuid.uuid4().hex),
+                "label": str(raw_record.get("label") or path.name),
+                "created_at": str(raw_record.get("created_at") or ""),
+                "path": history_relative_path(path),
+                "source_target": str(raw_record.get("source_target") or ""),
+                "version": max(1, _coerce_int(raw_record.get("version"), len(records) + 1, 1)),
+            })
+        if records:
+            records.sort(key=lambda entry: (entry.get("created_at", ""), int(entry.get("version", 0))))
+            result[item_id] = records
+    return result
+
+
+def save_version_history(history: dict[str, list[dict]]) -> None:
+    clean: dict[str, list[dict]] = {}
+    for raw_item_id, raw_records in dict(history or {}).items():
+        item_id = str(raw_item_id or "").strip()
+        if not item_id or not isinstance(raw_records, list):
+            continue
+        records = []
+        for raw_record in raw_records:
+            path = history_record_path(raw_record)
+            if path is None or not path.is_file():
+                continue
+            records.append({
+                "id": str(raw_record.get("id") or uuid.uuid4().hex),
+                "label": str(raw_record.get("label") or path.name),
+                "created_at": str(raw_record.get("created_at") or ""),
+                "path": history_relative_path(path),
+                "source_target": str(raw_record.get("source_target") or ""),
+                "version": max(1, _coerce_int(raw_record.get("version"), len(records) + 1, 1)),
+            })
+        if records:
+            clean[item_id] = records
+    write_json(history_index_file(), {
+        "schema_version": HISTORY_SCHEMA_VERSION,
+        "items": clean,
+    })
+
+
+def _sanitize_history_filename(value: str, suffix: str = "") -> str:
+    cleaned = "".join(
+        "_" if ch in '<>:"/\\|?*' or ord(ch) < 32 else ch
+        for ch in str(value or "")
+    ).strip(" .")
+    cleaned = re.sub(r"\s+", " ", cleaned)
+    if not cleaned:
+        cleaned = "版本"
+    suffix = str(suffix or "")
+    if suffix and len(cleaned) > max(1, 180 - len(suffix)):
+        cleaned = cleaned[:max(1, 180 - len(suffix))].rstrip(" .")
+    else:
+        cleaned = cleaned[:180].rstrip(" .")
+    stem = Path(cleaned).stem.casefold()
+    if stem in {"con", "prn", "aux", "nul", *(f"com{i}" for i in range(1, 10)), *(f"lpt{i}" for i in range(1, 10))}:
+        cleaned = "_" + cleaned
+    return cleaned
+
+
+def build_history_version_name(
+    source: Path,
+    mode: str,
+    pattern: str,
+    version: int,
+    *,
+    now: datetime | None = None,
+    suffix: str | None = None,
+) -> tuple[str, str]:
+    source = Path(source)
+    stamp = now or datetime.now()
+    version = max(1, int(version))
+    output_suffix = source.suffix if suffix is None else str(suffix)
+    normalized_mode = normalize_history_naming_mode(mode)
+    if normalized_mode == HISTORY_NAMING_VERSION:
+        label = f"v{version}"
+        filename = f"{source.stem}_{label}{output_suffix}"
+    elif normalized_mode == HISTORY_NAMING_CUSTOM:
+        validated = validate_history_naming_pattern(pattern)
+        values = {
+            "name": source.name,
+            "stem": source.stem,
+            "ext": output_suffix,
+            "date": stamp.strftime("%Y%m%d"),
+            "time": stamp.strftime("%H%M%S"),
+            "datetime": stamp.strftime("%Y%m%d_%H%M%S"),
+            "version": str(version),
+        }
+        rendered = validated.format_map(values).strip()
+        if output_suffix and not rendered.casefold().endswith(output_suffix.casefold()):
+            rendered += output_suffix
+        filename = rendered
+        label = Path(rendered).stem or f"v{version}"
+    else:
+        label = stamp.strftime("%Y-%m-%d %H:%M:%S")
+        filename = f"{source.stem}_{stamp.strftime('%Y%m%d_%H%M%S')}{output_suffix}"
+    safe_name = _sanitize_history_filename(filename, output_suffix)
+    if output_suffix and not safe_name.casefold().endswith(output_suffix.casefold()):
+        safe_name = _sanitize_history_filename(Path(safe_name).stem, output_suffix) + output_suffix
+    return safe_name, str(label)[:120]
 
 
 def load_settings() -> dict:
@@ -2640,6 +2911,13 @@ def load_settings() -> dict:
     if not (4 <= len(stored_share_code) <= 8 and stored_share_code.isdigit()):
         stored_share_code = ""
     ai_enabled = bool(settings.get("ai_enabled", False))
+    history_naming_mode = normalize_history_naming_mode(settings.get("history_naming_mode"))
+    history_naming_pattern = normalize_history_naming_pattern(settings.get("history_naming_pattern"))
+    if history_naming_mode == HISTORY_NAMING_CUSTOM:
+        try:
+            history_naming_pattern = validate_history_naming_pattern(history_naming_pattern)
+        except ValueError:
+            history_naming_pattern = DEFAULT_HISTORY_NAMING_PATTERN
     return {
         "schema_version": SETTINGS_SCHEMA_VERSION,
         "topmost": bool(settings.get("topmost", True)),
@@ -2665,6 +2943,8 @@ def load_settings() -> dict:
         "background_color": normalize_hex_color(settings.get("background_color")),
         "background_image": normalize_background_image(settings.get("background_image")),
         "store_dir": str(settings.get("store_dir") or DEFAULT_STORE_DIR),
+        "history_naming_mode": history_naming_mode,
+        "history_naming_pattern": history_naming_pattern,
         "recent_search_items": [
             {
                 "id": str(item.get("id", "")),
@@ -2797,6 +3077,8 @@ def save_settings(
     aira_mobile_enabled: bool = False,
     aira_relay_url: str = "",
     ai_external_interface_enabled: bool = True,
+    history_naming_mode: str = HISTORY_NAMING_TIME,
+    history_naming_pattern: str = DEFAULT_HISTORY_NAMING_PATTERN,
 ) -> None:
     clear_share_code = str(file_share_code or "").strip()
     protected_share_code = protect_password(clear_share_code) if clear_share_code else ""
@@ -2826,6 +3108,8 @@ def save_settings(
             "background_color": normalize_hex_color(background_color),
             "background_image": normalize_background_image(background_image),
             "store_dir": str(store_dir or STORE_DIR),
+            "history_naming_mode": normalize_history_naming_mode(history_naming_mode),
+            "history_naming_pattern": normalize_history_naming_pattern(history_naming_pattern),
             "recent_search_items": list(recent_search_items or [])[:SEARCH_RECENT_LIMIT],
             "ai_enabled": bool(ai_enabled),
             "ai_external_interface_enabled": bool(

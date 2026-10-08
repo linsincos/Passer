@@ -22,6 +22,7 @@ import re
 import secrets
 import shutil
 import socket
+import stat
 import subprocess
 import threading
 import traceback
@@ -128,7 +129,72 @@ if str(RESOURCE_DIR) not in sys.path:
     sys.path.insert(0, str(RESOURCE_DIR))
 if str(SCRIPT_DIR) not in sys.path:
     sys.path.insert(0, str(SCRIPT_DIR))
-from clicker_tool import ClickerTheme
+
+
+def _passer_bootstrap_data_dir() -> Path:
+    """Resolve PasserData early, before the shared code parts are loaded."""
+    base = os.environ.get("LOCALAPPDATA") or os.environ.get("APPDATA") or str(Path.home())
+    pointer = Path(base) / "Passer" / "datadir.txt"
+    try:
+        configured = pointer.read_text(encoding="utf-8").strip()
+    except OSError:
+        configured = ""
+    return Path(configured) if configured else SCRIPT_DIR / "PasserData"
+
+
+def _passer_code_cache_dir() -> Path:
+    if getattr(sys, "frozen", False):
+        return _passer_bootstrap_data_dir() / "Cache"
+    return SCRIPT_DIR / "__pycache__"
+
+
+def _configure_frozen_python_cache() -> "Path | None":
+    """Keep ordinary Python bytecode out of the directory containing Passer.exe."""
+    if not getattr(sys, "frozen", False) or not hasattr(sys, "pycache_prefix"):
+        return None
+    prefix = _passer_code_cache_dir() / "Python"
+    try:
+        sys.pycache_prefix = str(prefix)
+    except (AttributeError, TypeError):
+        return None
+    return prefix
+
+
+def _migrate_legacy_passer_code_cache() -> None:
+    """Move only Passer's old cache files and remove the folder when it is empty."""
+    if not getattr(sys, "frozen", False):
+        return
+    legacy_dir = SCRIPT_DIR / "__pycache__"
+    target_dir = _passer_code_cache_dir()
+    try:
+        cache_files = list(legacy_dir.glob("passer_shared_*.bin"))
+    except OSError:
+        return
+    if not cache_files:
+        return
+    try:
+        target_dir.mkdir(parents=True, exist_ok=True)
+    except OSError:
+        return
+    for source in cache_files:
+        destination = target_dir / source.name
+        try:
+            if destination.exists():
+                source.unlink()
+            else:
+                shutil.move(str(source), str(destination))
+        except (OSError, shutil.Error):
+            continue
+    try:
+        legacy_dir.rmdir()
+    except OSError:
+        pass
+
+
+_configure_frozen_python_cache()
+_migrate_legacy_passer_code_cache()
+
+from clicker_tool import ClickerTheme, minimize_frameless_window
 from passer_module_api import (
     API_VERSION as BUILTIN_MODULE_API_VERSION,
     MOD_DEFAULT_PERMISSIONS,
@@ -167,7 +233,7 @@ ai_list_plugins = None
 ai_run_plugin = None
 ai_usage_summary = None
 
-APP_VERSION = "v1.5.0"
+APP_VERSION = "v1.6.1"
 
 try:
     from tkinterdnd2 import COPY, DND_FILES, REFUSE_DROP, TkinterDnD
@@ -206,7 +272,7 @@ def _passer_part_cache_path(filename: str, source: bytes) -> Path:
     """Return a content-addressed cache path for a shared Passer code part."""
     digest = hashlib.sha256(source).hexdigest()[:20]
     cache_tag = getattr(sys.implementation, "cache_tag", "python") or "python"
-    return SCRIPT_DIR / "__pycache__" / f"passer_shared_{Path(filename).stem}.{cache_tag}.{digest}.bin"
+    return _passer_code_cache_dir() / f"passer_shared_{Path(filename).stem}.{cache_tag}.{digest}.bin"
 
 
 def _compile_passer_part(filename: str, path: Path, source: bytes):
@@ -261,6 +327,7 @@ class PasserFocusManager:
     def __init__(self, root: tk.Tk) -> None:
         self.root = root
         self._claim_generation: dict[str, int] = {}
+        self._recovery_generation: dict[str, int] = {}
         self._last_edit_target: dict[str, tk.Widget] = {}
         self._configure_win32_api()
 
@@ -364,6 +431,41 @@ class PasserFocusManager:
                     pass
 
     @staticmethod
+    def neutralize_ime(window) -> None:
+        """Close the IME so keystrokes reach widgets in borderless windows.
+
+        Passer's overrideredirect tool windows cannot host the IME composition
+        UI.  When another app left the IME open, clicking back into a Passer
+        entry delivers the keys to the IME (WM_KEYDOWN with VK_PROCESSKEY) and
+        no WM_CHAR is ever generated, so typing looks dead even though the Tk
+        focus landed correctly.  Forcing the input context closed on the focus
+        handoff routes characters to the widget again; the user can re-open the
+        IME with its own toggle key afterwards.
+        """
+        if sys.platform != "win32" or window is None:
+            return
+        try:
+            imm32 = ctypes.windll.imm32
+            imm32.ImmGetContext.argtypes = [wintypes.HWND]
+            imm32.ImmGetContext.restype = ctypes.c_void_p
+            imm32.ImmSetOpenStatus.argtypes = [ctypes.c_void_p, wintypes.BOOL]
+            imm32.ImmSetOpenStatus.restype = wintypes.BOOL
+            imm32.ImmReleaseContext.argtypes = [wintypes.HWND, ctypes.c_void_p]
+            imm32.ImmReleaseContext.restype = wintypes.BOOL
+            hwnd = wintypes.HWND(PasserFocusManager._root_hwnd(window))
+            if not hwnd:
+                return
+            imc = imm32.ImmGetContext(hwnd)
+            if not imc:
+                return
+            try:
+                imm32.ImmSetOpenStatus(imc, False)
+            finally:
+                imm32.ImmReleaseContext(hwnd, imc)
+        except Exception:
+            pass
+
+    @staticmethod
     def editable_target(widget):
         current = widget
         while current is not None:
@@ -371,7 +473,9 @@ class PasserFocusManager:
                 widget_class = current.winfo_class()
                 state = str(current.cget("state")) if "state" in current.keys() else "normal"
                 if (
-                    widget_class in ("Entry", "TEntry", "Text", "TCombobox", "Spinbox")
+                    widget_class in (
+                        "Entry", "TEntry", "Text", "TCombobox", "Spinbox", "TSpinbox",
+                    )
                     and state not in ("disabled", "readonly")
                 ):
                     return current
@@ -390,6 +494,46 @@ class PasserFocusManager:
             return None
         return self.editable_target(widget)
 
+    def cancel_pending(self, window) -> None:
+        """Invalidate focus retries queued before an intentional minimize."""
+        key = self._window_key(window)
+        self._claim_generation[key] = self._claim_generation.get(key, 0) + 1
+        self._recovery_generation[key] = self._recovery_generation.get(key, 0) + 1
+
+    def _can_recover_focus(self, window) -> bool:
+        try:
+            # Retrying focus must not restore either the editor or its owner.
+            return (window.state() in ("normal", "zoomed")
+                    and self.root.state() in ("normal", "zoomed"))
+        except (tk.TclError, RuntimeError):
+            return False
+
+    def can_activate_from_click(self, window, event) -> bool:
+        # The widget command runs before the toplevel's release binding. It may
+        # have just minimized, hidden, destroyed or opened another window.
+        if not self._can_recover_focus(window):
+            return False
+        if getattr(event, "type", None) == tk.EventType.ButtonRelease:
+            # Press already activated this window. Respect any focus handoff
+            # performed by the button command before its release bubbles up.
+            if not self._is_foreground(window):
+                return False
+            try:
+                focused = window.focus_get()
+                if focused is not None and focused.winfo_toplevel() is not window:
+                    return False
+            except (tk.TclError, RuntimeError):
+                return False
+        return True
+
+    def activate_from_click(self, window, event) -> None:
+        if not self.can_activate_from_click(window, event):
+            return
+        self.activate(window)
+        target = self.editable_target(getattr(event, "widget", None))
+        if target is not None:
+            self.claim(window, target, activate=False)
+
     def claim(self, window, target, *, activate: bool = True) -> None:
         if window is None or target is None:
             return
@@ -400,18 +544,19 @@ class PasserFocusManager:
         if activate:
             self.activate(window)
 
-        def focus() -> None:
+        def focus(*, retry: bool = False) -> None:
             try:
                 if self._claim_generation.get(key) != generation or not target.winfo_exists():
                     return
-                # focus_force/SetFocus only work reliably after Windows has accepted
-                # the borderless toplevel as foreground. Later retries handle the
-                # common case where the first mouse press was consumed by activation.
+                if not self._can_recover_focus(window):
+                    return
+                # Only the immediate user action may activate a window. Delayed
+                # retries must respect a subsequent switch to another app.
                 if not self._is_foreground(window):
-                    if activate:
-                        self.activate(window)
-                    if not self._is_foreground(window):
+                    if retry:
                         return
+                    self.activate(window)
+                self.neutralize_ime(window)
                 target.focus_set()
                 if window.focus_get() is not target:
                     target.focus_force()
@@ -422,9 +567,10 @@ class PasserFocusManager:
 
         focus()
         try:
-            window.after_idle(focus)
-            window.after(25, focus)
-            window.after(90, focus)
+            window.after_idle(lambda: focus(retry=True))
+            window.after(25, lambda: focus(retry=True))
+            window.after(90, lambda: focus(retry=True))
+            window.after(180, lambda: focus(retry=True))
         except Exception:
             pass
 
@@ -433,8 +579,14 @@ class PasserFocusManager:
         if window is None:
             return
         key = self._window_key(window)
+        generation = self._recovery_generation.get(key, 0)
 
         def recover() -> None:
+            if (self._recovery_generation.get(key, 0) != generation
+                    or not self._can_recover_focus(window)
+                    or not self._is_foreground(window)):
+                return
+            self.neutralize_ime(window)
             try:
                 target = resolver() if resolver is not None else self.target_under_pointer(window)
             except Exception:
@@ -461,6 +613,7 @@ class PasserFocusManager:
         try:
             window.after_idle(recover)
             window.after(35, recover)
+            window.after(110, recover)
         except Exception:
             pass
 
@@ -496,6 +649,13 @@ class RelayDockApp:
         self._last_items_snapshot = [asdict(item) for item in self.items]
         self._widget_undo_stacks: dict[str, list[str]] = {}
         self.settings = load_settings()
+        self.history_naming_mode = normalize_history_naming_mode(
+            self.settings.get("history_naming_mode")
+        )
+        self.history_naming_pattern = normalize_history_naming_pattern(
+            self.settings.get("history_naming_pattern")
+        )
+        self.version_history: dict[str, list[dict]] = load_version_history()
         # Aira is strictly opt-in for each Passer session; never restore a receiver at startup.
         self.settings["aira_monitor_enabled"] = False
         self.theme_color = apply_passer_theme_color(self.settings.get("theme_color"))
@@ -565,6 +725,7 @@ class RelayDockApp:
         self.media_viewers = []
         self.archive_viewers = []
         self.audio_editors = []
+        self.version_manager_windows = []
         self.clicker_window = None
         self.random_window = None
         self.plan_window = None
@@ -579,6 +740,7 @@ class RelayDockApp:
         self.network_window = None
         self.server_window = None
         self.server_service = None
+        self.clipboard_window = None
         self.mail_window = None
         self.qr_window = None
         self.markdown_window = None
@@ -672,6 +834,8 @@ class RelayDockApp:
         self._background_photo = None
         self._background_source_signature = None
         self._background_render_size = None
+        self._main_minimize_in_progress = False
+        self._main_frame_restore_after_id = None
 
         enable_dpi_awareness()
         self.root = TkinterDnD.Tk() if TKDND_AVAILABLE else tk.Tk()
@@ -920,10 +1084,20 @@ class RelayDockApp:
         self.menu = tk.Menu(self.root, tearoff=False)
         self.menu.add_command(label="打开", command=self.open_selected)
         self.menu.add_command(label="默认应用打开", command=self.open_selected_with_default)
+        self.history_menu_label = "历史版本"
+        self.history_menu = tk.Menu(self.menu, tearoff=False)
+        self.history_menu.add_command(label="版本管理", state=tk.DISABLED)
+        self.history_menu.add_separator()
+        self.history_menu.add_command(label="暂无历史版本", state=tk.DISABLED)
+        self.menu.add_cascade(
+            label=self.history_menu_label,
+            menu=self.history_menu,
+            state=tk.DISABLED,
+        )
         # 「Zotero 打开」按需插入：仅当选中项为 PDF 文件时才显示（见 show_item_menu）。
         self.zotero_menu_label = "Zotero 打开" if self.zotero_path else None
         self._zotero_in_menu = False
-        self._zotero_insert_index = self.menu.index(tk.END) + 1  # 紧跟「默认应用打开」之后
+        self._zotero_insert_index = self.menu.index(tk.END) + 1  # 紧跟「历史版本」之后
         self.menu.add_command(label="在资源管理器中显示", command=self.reveal_selected)
         self.menu.add_command(label="复制", command=self.copy_selected_default)
         self.menu.add_command(label="复制文件", command=self.copy_selected_target)
@@ -1444,6 +1618,8 @@ class RelayDockApp:
             "image_open_mode": self.image_open_mode,
             "video_open_mode": self.video_open_mode,
             "audio_open_mode": self.audio_open_mode,
+            "history_naming_mode": self.history_naming_mode,
+            "history_naming_pattern": self.history_naming_pattern,
         }, ensure_ascii=False, indent=2)
 
     @staticmethod
@@ -1476,6 +1652,10 @@ class RelayDockApp:
             "ai_thinking_mode": "thinking_mode", "ai_reasoning": "reasoning",
             "ai_persona": "persona", "ai_prompt_cache": "prompt_cache",
             "width": "window_width", "height": "window_height",
+            "history_naming": "history_naming_mode",
+            "version_naming": "history_naming_mode",
+            "history_pattern": "history_naming_pattern",
+            "version_naming_pattern": "history_naming_pattern",
         }
         raw = {aliases.get(str(key).strip().lower(), str(key).strip().lower()): value
                for key, value in raw.items()}
@@ -1501,6 +1681,7 @@ class RelayDockApp:
             "persona", "prompt_cache", "search_hotkey", "ai_hotkey",
             "office_open_mode", "folder_open_mode", "code_open_mode",
             "pdf_open_mode", "image_open_mode", "video_open_mode", "audio_open_mode",
+            "history_naming_mode", "history_naming_pattern",
         }
         unknown = sorted(set(raw) - allowed)
         if unknown:
@@ -1598,6 +1779,25 @@ class RelayDockApp:
             if not persona:
                 raise ValueError("persona 可选：" + "、".join(str(cfg.get("label", key)) for key, cfg in AI_PERSONAS.items()))
             values["persona"] = persona
+        if "history_naming_mode" in raw:
+            mode_raw = str(raw["history_naming_mode"] or "").strip()
+            mode_lookup = {
+                **{key.casefold(): key for key in HISTORY_NAMING_LABELS},
+                **{label.casefold(): key for key, label in HISTORY_NAMING_LABELS.items()},
+                "date": HISTORY_NAMING_TIME,
+                "datetime": HISTORY_NAMING_TIME,
+                "number": HISTORY_NAMING_VERSION,
+                "version_number": HISTORY_NAMING_VERSION,
+            }
+            history_mode = mode_lookup.get(mode_raw.casefold())
+            if history_mode is None:
+                raise ValueError("history_naming_mode 可选：time、version、custom（时间/版本号/自定义）。")
+            values["history_naming_mode"] = history_mode
+        if "history_naming_pattern" in raw:
+            values["history_naming_pattern"] = validate_history_naming_pattern(
+                raw["history_naming_pattern"]
+            )
+            values.setdefault("history_naming_mode", HISTORY_NAMING_CUSTOM)
 
         search_hotkey = self.search_hotkey
         ai_hotkey = self.ai_hotkey
@@ -1680,6 +1880,10 @@ class RelayDockApp:
             self.ai_persona = str(values["persona"])
         if "prompt_cache" in values:
             self.ai_prompt_cache = bool(values["prompt_cache"])
+        if "history_naming_mode" in values:
+            self.history_naming_mode = str(values["history_naming_mode"])
+        if "history_naming_pattern" in values:
+            self.history_naming_pattern = str(values["history_naming_pattern"])
         if "search_hotkey" in values:
             self.search_hotkey = str(values["search_hotkey"])
             self.hotkey_search_down = False
@@ -1701,8 +1905,20 @@ class RelayDockApp:
             "ai_prompt_cache": self.ai_prompt_cache,
             "search_hotkey": self.search_hotkey,
             "ai_hotkey": self.ai_hotkey,
+            "history_naming_mode": self.history_naming_mode,
+            "history_naming_pattern": self.history_naming_pattern,
             **{field: getattr(self, field) for field in mode_normalizers},
         })
+        settings_window = getattr(self, "settings_window", None)
+        try:
+            if settings_window is not None and settings_window.winfo_exists():
+                settings_window._history_naming_mode_var.set(
+                    HISTORY_NAMING_LABELS[self.history_naming_mode]
+                )
+                settings_window._history_naming_pattern_var.set(self.history_naming_pattern)
+                settings_window._refresh_history_naming_controls()
+        except (AttributeError, KeyError, tk.TclError):
+            pass
         self.apply_ai_settings()
         if self.ai_chat is not None:
             self.ai_chat.sync_provider()
@@ -4189,6 +4405,7 @@ class RelayDockApp:
             BUILTIN_SHUTDOWN_TARGET: self.open_shutdown_tool,
             BUILTIN_NETWORK_TARGET: self.open_network_tool,
             BUILTIN_SERVER_TARGET: self.open_server_tool,
+            BUILTIN_CLIPBOARD_TARGET: self.open_clipboard_tool,
             BUILTIN_MAIL_TARGET: self.open_mail_tool,
             BUILTIN_QR_TARGET: self.open_qr_tool,
             BUILTIN_MARKDOWN_TARGET: self.open_markdown_tool,
@@ -4587,9 +4804,16 @@ class RelayDockApp:
         self.root.bind_all("<KeyPress>", self.remember_widget_edit, add="+")
         self.root.bind_all("<Delete>", self.on_delete_key)
         self.root.bind_all("<Alt-F4>", lambda event: self.close())
+        self.root.bind_all("<ButtonPress-1>", self._neutralize_ime_on_pointer_press, add="+")
+        self.root.bind("<Left>", lambda event: self.navigate_selected_item(event, -1, 0), add="+")
+        self.root.bind("<Right>", lambda event: self.navigate_selected_item(event, 1, 0), add="+")
+        self.root.bind("<Up>", lambda event: self.navigate_selected_item(event, 0, -1), add="+")
+        self.root.bind("<Down>", lambda event: self.navigate_selected_item(event, 0, 1), add="+")
         self.root.bind("<Map>", self.restore_custom_frame)
         self.root.bind("<Map>", lambda _event: self._schedule_tile_visibility_refresh(40), add="+")
         self.root.bind("<Activate>", self._recover_main_focus_on_activate, add="+")
+        self.root.bind("<FocusIn>", self._recover_main_focus_on_activate, add="+")
+        self.root.bind("<ButtonRelease-1>", self.activate_main_window, add="+")
         self.root.bind("<Configure>", self._schedule_responsive_layout, add="+")
         self.titlebar.bind("<Configure>", self._layout_search_box, add="+")
         self.root.after_idle(lambda: self._apply_responsive_layout(force=True))
@@ -4743,6 +4967,8 @@ class RelayDockApp:
         return self._main_input_target_from_widget(widget)
 
     def _recover_main_focus_on_activate(self, event=None) -> None:
+        if self._main_minimize_in_progress:
+            return
         if getattr(event, "widget", None) is not self.root:
             return
         self.focus_manager.recover_from_pointer(
@@ -4750,7 +4976,16 @@ class RelayDockApp:
 
     def activate_main_window(self, event=None) -> None:
         """Reactivate the main window when it is clicked."""
+        # The minimize button's command runs before the root-level release
+        # binding. Without this guard that same release immediately calls
+        # deiconify(), making the minimize button appear broken.
+        if self._main_minimize_in_progress:
+            return
         try:
+            if event is not None and not self.focus_manager.can_activate_from_click(self.root, event):
+                return
+            if event is not None and self.root.state() not in ("normal", "zoomed"):
+                return
             if self.root.state() != "normal":
                 self.root.deiconify()
             self.focus_manager.activate(self.root)
@@ -4759,13 +4994,76 @@ class RelayDockApp:
         except (tk.TclError, AttributeError, OSError):
             pass
 
+    def _neutralize_ime_on_pointer_press(self, event=None) -> None:
+        """Close a stale IME before it can swallow the keystrokes after a click-in.
+
+         bind_all  sees the press no matter which Passer toplevel owns the
+        widget, so ad-hoc dialogs and popups that never went through the
+        focus-recovery registration get the same protection as the registered
+        tool and viewer windows.
+        """
+        widget = getattr(event, "widget", None)
+        if widget is None:
+            return
+        try:
+            window = widget.winfo_toplevel()
+        except Exception:
+            return
+        self.focus_manager.neutralize_ime(window)
+
     def minimize_window(self) -> None:
-        self.root.overrideredirect(False)
-        self.root.iconify()
+        if self._main_minimize_in_progress:
+            return
+        self._main_minimize_in_progress = True
+        self.focus_manager.cancel_pending(self.root)
+        if self._main_frame_restore_after_id is not None:
+            try:
+                self.root.after_cancel(self._main_frame_restore_after_id)
+            except (tk.TclError, RuntimeError):
+                pass
+            self._main_frame_restore_after_id = None
+        minimize_frameless_window(self.root)
+
+        def finish_transition() -> None:
+            self._main_minimize_in_progress = False
+            # A taskbar restore may have arrived during the transition guard.
+            # Reconcile the actual state even when minimizing initially succeeded.
+            try:
+                if self.root.state() == "normal":
+                    self.root.overrideredirect(True)
+            except (tk.TclError, RuntimeError):
+                pass
+
+        try:
+            self.root.after(140, finish_transition)
+        except (tk.TclError, RuntimeError):
+            finish_transition()
 
     def restore_custom_frame(self, event=None) -> None:
-        if self.root.state() == "normal":
-            self.root.after(10, lambda: self.root.overrideredirect(True))
+        if getattr(event, "widget", self.root) is not self.root:
+            return
+        if self._main_minimize_in_progress:
+            return
+        if self._main_frame_restore_after_id is not None:
+            try:
+                self.root.after_cancel(self._main_frame_restore_after_id)
+            except (tk.TclError, RuntimeError):
+                pass
+
+        def restore() -> None:
+            self._main_frame_restore_after_id = None
+            if self._main_minimize_in_progress:
+                return
+            try:
+                if self.root.state() == "normal":
+                    self.root.overrideredirect(True)
+            except (tk.TclError, RuntimeError):
+                pass
+
+        try:
+            self._main_frame_restore_after_id = self.root.after(35, restore)
+        except (tk.TclError, RuntimeError):
+            pass
 
     def start_resize(self, event) -> None:
         self.resize_start = (event.x_root, event.y_root, self.root.winfo_width(), self.root.winfo_height())
@@ -4779,6 +5077,8 @@ class RelayDockApp:
         self.root.geometry(f"{width}x{height}")
 
     def ensure_window_visible(self) -> None:
+        if self._main_minimize_in_progress or self.root.state() == "iconic":
+            return
         if self._startup_stage is not None:
             self.root.after(250, self.ensure_window_visible)
             return
@@ -4981,34 +5281,26 @@ class RelayDockApp:
         try:
             if self.root.state() != "normal" or not self.canvas.winfo_ismapped():
                 return
-            canvas_left = self.canvas.winfo_rootx()
-            canvas_top = self.canvas.winfo_rooty()
-            canvas_right = canvas_left + self.canvas.winfo_width()
-            canvas_bottom = canvas_top + self.canvas.winfo_height()
-            content_left = self.content.winfo_rootx()
-            content_top = self.content.winfo_rooty()
+            viewport_left = float(self.canvas.canvasx(0))
+            viewport_top = float(self.canvas.canvasy(0))
+            viewport_right = viewport_left + max(1, self.canvas.winfo_width())
+            viewport_bottom = viewport_top + max(1, self.canvas.winfo_height())
         except tk.TclError:
             return
 
-        viewport = (canvas_left, canvas_top, canvas_right, canvas_bottom)
-        occluders = self._aira_occluder_rects()
+        # Keep the visibility calculation entirely in canvas/content coordinates.
+        # Root-screen coordinates can briefly be stale while a paste causes Tk to
+        # resize the scroll region and Aira relays out; that race used to classify
+        # a whole row as covered and leave its widgets place_forget()'en.
+        viewport = (viewport_left, viewport_top, viewport_right, viewport_bottom)
         for item in self.top_level_items():
             widgets = self.tile_widgets.get(item.id)
             if not widgets:
                 continue
             tile = widgets[0]
             x, y = self.item_pixel_position(item)
-            tile_rect = (
-                content_left + x, content_top + y,
-                content_left + x + TILE_WIDTH, content_top + y + TILE_HEIGHT,
-            )
-            fully_inside = (
-                tile_rect[0] >= viewport[0] and tile_rect[1] >= viewport[1]
-                and tile_rect[2] <= viewport[2] and tile_rect[3] <= viewport[3]
-            )
-            visible = fully_inside and not any(
-                self._rectangles_overlap(tile_rect, blocked) for blocked in occluders
-            )
+            tile_rect = (x, y, x + TILE_WIDTH, y + TILE_HEIGHT)
+            visible = self._rectangles_overlap(tile_rect, viewport)
             try:
                 manager = tile.winfo_manager()
                 if visible and manager != "place":
@@ -5017,6 +5309,16 @@ class RelayDockApp:
                     tile.place_forget()
             except tk.TclError:
                 continue
+
+        # Tiles remapped while scrolling must stay below Aira's controls.  Raising
+        # the existing overlay is stable and does not depend on geometry guesses.
+        chat = getattr(self, "ai_chat", None)
+        lift_widgets = getattr(chat, "_lift_widgets", None)
+        if callable(lift_widgets):
+            try:
+                lift_widgets()
+            except tk.TclError:
+                pass
 
     def write_status(self, text: str) -> None:
         self.status_var.set(text)
@@ -5046,7 +5348,7 @@ class RelayDockApp:
         singles = (
             self.clicker_window, self.random_window, self.plan_window, self.aira_window,
             self.calculator_window, self.shutdown_window, self.network_window, self.server_window,
-            self.mail_window, self.qr_window,
+            self.mail_window, self.qr_window, self.clipboard_window,
             self.markdown_window, self.file_search_window,
             self.screen_record_window, self.magnet_window, self.map_window, self.device_lock_window,
             self.device_info_window,
@@ -5063,7 +5365,8 @@ class RelayDockApp:
                     yield win
         for viewers in (self.image_viewers, self.pdf_viewers, self.text_viewers,
                         self.excel_viewers, self.folder_viewers,
-                        self.media_viewers, self.archive_viewers, self.audio_editors):
+                        self.media_viewers, self.archive_viewers, self.audio_editors,
+                        self.version_manager_windows):
             for viewer in list(viewers):
                 if not getattr(viewer, "closed", True):
                     win = getattr(viewer, "window", None)
@@ -5299,6 +5602,31 @@ class RelayDockApp:
             )
         self.place_tool_window_on_passer(self.server_window)
         self.write_status("已打开服务器工具。")
+
+    def clipboard_theme(self) -> ClickerTheme:
+        return ClickerTheme(
+            title=BUILTIN_CLIPBOARD_TITLE,
+            border=BORDER,
+            app_bg=APP_BG,
+            surface_bg=SURFACE_BG,
+            title_bg=TITLE_BG,
+            muted_fg=MUTED_FG,
+            accent=ACCENT,
+            danger=DANGER,
+            app_font=app_font,
+            center_over_root=center_over_root,
+            place_toplevel_absolute=place_toplevel_absolute,
+        )
+
+    def open_clipboard_tool(self) -> None:
+        opener = _load_symbol("clipboard_tool", "open_tool")
+        self.clipboard_window = opener(self, self.clipboard_theme())
+        self.place_tool_window_on_passer(self.clipboard_window)
+        self.write_status("已打开剪贴板工具；历史仅保留在本次窗口内。")
+
+    def write_files_to_clipboard(self, paths) -> bool:
+        """Expose Passer's native CF_HDROP writer to the lazy clipboard tool."""
+        return copy_paths_to_clipboard([str(path) for path in paths])
 
     def mail_theme(self) -> ClickerTheme:
         return ClickerTheme(
@@ -6290,11 +6618,7 @@ class RelayDockApp:
             and not getattr(window, "_passer_focus_recovery_bound", False)
         ):
             def activate_owned_window(event, target=window) -> None:
-                clicked = getattr(event, "widget", None)
-                self.focus_manager.activate(target)
-                edit_target = self.focus_manager.editable_target(clicked)
-                if edit_target is not None:
-                    self.focus_manager.claim(target, edit_target, activate=False)
+                self.focus_manager.activate_from_click(target, event)
 
             def recover_owned_window(event, target=window) -> None:
                 if getattr(event, "widget", None) is target:
@@ -6302,7 +6626,9 @@ class RelayDockApp:
 
             try:
                 window.bind("<ButtonPress-1>", activate_owned_window, add="+")
+                window.bind("<ButtonRelease-1>", activate_owned_window, add="+")
                 window.bind("<Activate>", recover_owned_window, add="+")
+                window.bind("<FocusIn>", recover_owned_window, add="+")
                 window._passer_focus_recovery_bound = True
             except Exception:
                 pass
@@ -6363,6 +6689,8 @@ class RelayDockApp:
             self.apply_window_transparency(self.plan_window.window)
         if self.mail_window is not None and not getattr(self.mail_window, "closed", True):
             self.apply_window_transparency(self.mail_window.window)
+        if self.clipboard_window is not None and not getattr(self.clipboard_window, "closed", True):
+            self.apply_window_transparency(self.clipboard_window.window)
 
     def _iter_font_refresh_windows(self):
         seen: set[str] = set()
@@ -6564,6 +6892,8 @@ class RelayDockApp:
             aira_mobile_enabled=self.settings.get("aira_mobile_enabled", False),
             aira_relay_url=self.settings.get("aira_relay_url", ""),
             ai_external_interface_enabled=self.ai_external_interface_enabled,
+            history_naming_mode=self.history_naming_mode,
+            history_naming_pattern=self.history_naming_pattern,
         )
         self._recent_search_dirty = False
 
@@ -7137,6 +7467,8 @@ class RelayDockApp:
 
         self._close_controller(getattr(self, "server_window", None))
         self.server_window = None
+        self._close_controller(getattr(self, "clipboard_window", None))
+        self.clipboard_window = None
         server_service = getattr(self, "server_service", None)
         if server_service is not None:
             try:
@@ -7162,7 +7494,7 @@ class RelayDockApp:
         viewer_attrs = (
             "image_viewers", "pdf_viewers", "text_viewers", "excel_viewers",
             "shell_preview_viewers", "folder_viewers", "media_viewers",
-            "archive_viewers", "audio_editors",
+            "archive_viewers", "audio_editors", "version_manager_windows",
         )
         for attr in viewer_attrs:
             viewers = getattr(self, attr, [])
@@ -7855,18 +8187,16 @@ class RelayDockApp:
             return
         if not getattr(window, "_passer_activation_bound", False):
             def reactivate_tool_window(event, target=window) -> None:
-                clicked = getattr(event, "widget", None)
-                self.focus_manager.activate(target)
-                edit_target = self.focus_manager.editable_target(clicked)
-                if edit_target is not None:
-                    self.focus_manager.claim(target, edit_target, activate=False)
+                self.focus_manager.activate_from_click(target, event)
 
             def recover_tool_window(event, target=window) -> None:
                 if getattr(event, "widget", None) is target:
                     self.focus_manager.recover_from_pointer(target)
 
             window.bind("<ButtonPress-1>", reactivate_tool_window, add="+")
+            window.bind("<ButtonRelease-1>", reactivate_tool_window, add="+")
             window.bind("<Activate>", recover_tool_window, add="+")
+            window.bind("<FocusIn>", recover_tool_window, add="+")
             window._passer_activation_bound = True
         try:
             window.update_idletasks()
@@ -9608,6 +9938,7 @@ class RelayDockApp:
             item.target,
             item.display_title,
             item.mark_color,
+            self.history_version_count(item),
             source_version,
             members,
         )
@@ -9617,7 +9948,7 @@ class RelayDockApp:
 
         Packaged WindowsApps apps (Claude, Codex, …) can't be stat'd by their
         full path — they're launched via their AppsFolder AUMID — so they would
-        wrongly fail an ``os.path.exists`` check. Never flag them as broken.
+        wrongly fail an  os.path.exists  check. Never flag them as broken.
         """
         if item.kind in ("url", "group", "map_location", BUILTIN_TOOL_KIND):
             return False
@@ -9729,6 +10060,17 @@ class RelayDockApp:
         if broken:
             tile.create_oval(TILE_WIDTH - 28, 4, TILE_WIDTH - 6, 26, outline="", fill=DANGER)
             tile.create_text(TILE_WIDTH - 17, 15, text="!", fill="white", font=app_font(10, "bold"))
+
+        version_count = self.history_version_count(item)
+        if version_count:
+            tile.create_text(
+                TILE_WIDTH - 7,
+                31 if broken else 7,
+                text=f"+{version_count}",
+                anchor=tk.NE,
+                fill=ACCENT,
+                font=app_font(7, "bold"),
+            )
 
         title_color = DANGER if broken else "#111827"
         display_title = fit_text_lines(item.display_title, self.tile_font, TILE_WIDTH - 16, max_lines=2)
@@ -9842,6 +10184,13 @@ class RelayDockApp:
         self.destroy_icon_drag_preview()
         self.hide_tooltip()
         self.remember_paste_target(event)
+        # A tile is not focusable by design. Move keyboard focus back to the main
+        # window so the arrow keys work immediately after selecting an item,
+        # instead of continuing to edit the previously focused Aira/search box.
+        try:
+            self.root.focus_set()
+        except tk.TclError:
+            pass
         # Clicking a different tile dismisses an open group overlay; clicking the
         # overlay's own group is left to finish_icon_drag so the click can toggle it.
         if self.group_overlay is not None and self.group_overlay.group_id != item.id:
@@ -9947,6 +10296,100 @@ class RelayDockApp:
         if self.selected_ids:
             self.write_status(f"已选 {len(self.selected_ids)} 项。")
 
+    @staticmethod
+    def _widget_reserves_arrow_keys(widget) -> bool:
+        """Return whether an editor/control should keep its native arrow keys."""
+        current = widget
+        reserved = {
+            "Entry", "TEntry", "Text", "TCombobox", "Spinbox", "TSpinbox",
+            "Listbox", "Treeview", "TTreeview", "Scale", "TScale", "Menu",
+        }
+        while current is not None:
+            try:
+                if current.winfo_class() in reserved:
+                    return True
+            except Exception:
+                pass
+            current = getattr(current, "master", None)
+        return False
+
+    def directional_item_neighbor(
+        self, current: DockItem, horizontal: int, vertical: int
+    ) -> DockItem | None:
+        """Find the best aligned top-level tile in the requested direction."""
+        current_col = int(current.grid_x or 0)
+        current_row = int(current.grid_y or 0)
+        candidates: list[tuple[tuple, DockItem]] = []
+
+        for item in self.top_level_items():
+            if item.id == current.id:
+                continue
+            col = int(item.grid_x or 0)
+            row = int(item.grid_y or 0)
+            delta_col = col - current_col
+            delta_row = row - current_row
+            if horizontal and delta_col * horizontal <= 0:
+                continue
+            if vertical and delta_row * vertical <= 0:
+                continue
+
+            if horizontal:
+                score = (abs(delta_row), abs(delta_col), row, col, item.id)
+            else:
+                score = (abs(delta_col), abs(delta_row), col, row, item.id)
+            candidates.append((score, item))
+
+        if not candidates:
+            return None
+        return min(candidates, key=lambda pair: pair[0])[1]
+
+    def scroll_item_into_view(self, item: DockItem) -> None:
+        """Keep a keyboard-selected tile visible without rebuilding the grid."""
+        try:
+            self.update_content_size()
+            self.content.update_idletasks()
+            _x, item_top = self.item_pixel_position(item)
+            viewport_top = float(self.canvas.canvasy(0))
+            viewport_height = max(1, int(self.canvas.winfo_height()))
+            viewport_bottom = viewport_top + viewport_height
+            item_bottom = item_top + TILE_HEIGHT
+            if item_top < viewport_top:
+                target_top = max(0, item_top - TILE_PAD)
+            elif item_bottom > viewport_bottom:
+                target_top = max(0, item_bottom + TILE_PAD - viewport_height)
+            else:
+                return
+            content_height = max(1, int(self.content.winfo_height()))
+            self.canvas.yview_moveto(min(1.0, target_top / content_height))
+            self._schedule_tile_visibility_refresh(0)
+        except (tk.TclError, AttributeError, TypeError, ValueError):
+            pass
+
+    def navigate_selected_item(self, event, horizontal: int, vertical: int):
+        """Move a single main-grid selection with an unmodified arrow key."""
+        state = int(getattr(event, "state", 0) or 0)
+        if state & (SHIFT_MASK | CTRL_MASK | 0x0008 | 0x20000):
+            return None
+        if self._widget_reserves_arrow_keys(getattr(event, "widget", None)):
+            return None
+        if getattr(self, "group_overlay", None) is not None:
+            return None
+        if len(self.selected_ids) != 1:
+            return None
+
+        current = self.item_by_id(next(iter(self.selected_ids)))
+        if current is None or current.group_id:
+            return None
+        target = self.directional_item_neighbor(current, horizontal, vertical)
+        if target is None:
+            return "break"
+
+        self.selected_ids = {target.id}
+        self.anchor_selected_id = target.id
+        self.update_selection_styles(check_broken=False)
+        self.scroll_item_into_view(target)
+        return "break"
+
     def select_item(self, item: DockItem, event=None) -> None:
         state = event.state if event is not None else 0
         item_ids = [old.id for old in self.items]
@@ -9979,6 +10422,179 @@ class RelayDockApp:
         self.update_selection_styles()
         self.open_item(item)
 
+    def history_origin_item(self, item: DockItem) -> DockItem:
+        """Resolve a viewer/history copy back to the stable tile it belongs to."""
+        return self.item_by_id(str(item.id)) or item
+
+    def version_history_records(self, item: DockItem) -> list[dict]:
+        records = list(self.version_history.get(str(item.id), ()))
+        valid = []
+        for record in records:
+            path = history_record_path(record)
+            if path is not None and path.is_file():
+                valid.append(record)
+        if len(valid) != len(records):
+            if valid:
+                self.version_history[str(item.id)] = valid
+            else:
+                self.version_history.pop(str(item.id), None)
+        return valid
+
+    def history_version_count(self, item: DockItem) -> int:
+        if item.kind in ("url", "folder", "group", "map_location", BUILTIN_TOOL_KIND):
+            return 0
+        # The index is validated once when loaded. Keep tile signatures free of
+        # per-frame filesystem stats; the context menu revalidates before opening.
+        return len(self.version_history.get(str(item.id), ()))
+
+    def save_item_as_new_version(
+        self,
+        item: DockItem,
+        *,
+        writer=None,
+        suffix: str | None = None,
+        source_path: str | os.PathLike | None = None,
+    ) -> Path | None:
+        """Snapshot a local file into PasserData/Versions without changing its source."""
+        origin = self.history_origin_item(item)
+        source = Path(source_path or item.target)
+        if writer is None and not source.is_file():
+            messagebox.showinfo("无法创建版本", f"找不到要保存的文件：\n{source}", parent=self.root)
+            return None
+        records = self.version_history_records(origin)
+        next_version = max(
+            [int(record.get("version") or 0) for record in records] or [0]
+        ) + 1
+        naming_source = Path(origin.target) if Path(origin.target).suffix else source
+        try:
+            filename, label = build_history_version_name(
+                naming_source,
+                self.history_naming_mode,
+                self.history_naming_pattern,
+                next_version,
+                suffix=suffix,
+            )
+            destination_dir = history_item_directory(origin.id)
+            destination = unique_path(destination_dir, Path(filename).stem, Path(filename).suffix)
+            destination.parent.mkdir(parents=True, exist_ok=True)
+            if writer is None:
+                shutil.copy2(source, destination)
+            else:
+                writer(destination)
+            if not destination.is_file():
+                raise OSError("查看器未生成版本文件。")
+            # copy2 preserves Windows' read-only attribute. History snapshots
+            # belong to Passer and must remain manageable even when the source
+            # (for example a WeChat attachment) is read-only.
+            make_path_writable(destination)
+            record = {
+                "id": uuid.uuid4().hex,
+                "label": label,
+                "created_at": datetime.now().isoformat(timespec="seconds"),
+                "path": history_relative_path(destination),
+                "source_target": str(origin.target),
+                "version": next_version,
+            }
+            updated = records + [record]
+            self.version_history[str(origin.id)] = updated
+            try:
+                save_version_history(self.version_history)
+            except Exception:
+                self.version_history[str(origin.id)] = records
+                make_path_writable(destination)
+                destination.unlink(missing_ok=True)
+                raise
+        except Exception as exc:
+            self._log_unexpected(
+                exc,
+                module="versions",
+                action="save_new_version",
+                target_path=source,
+                expected=(OSError, ValueError),
+            )
+            messagebox.showinfo(
+                "版本保存失败",
+                f"无法另存为新版本：\n{source}\n\n{exc}",
+                parent=self.root,
+            )
+            return None
+        self.tile_signatures.pop(str(origin.id), None)
+        self.schedule_render()
+        self.write_status(f"已保存新版本：{label}（{destination.name}）")
+        return destination
+
+    def open_history_version(self, item: DockItem, record: dict) -> None:
+        path = history_record_path(record)
+        if path is None or not path.is_file():
+            messagebox.showinfo("版本不存在", "该历史版本文件已被移动或删除。", parent=self.root)
+            return
+        origin = self.history_origin_item(item)
+        version_item = copy.copy(origin)
+        version_item.target = str(path)
+        version_item.title = f"{origin.title} · {record.get('label') or path.name}"
+        version_item.passer_name = None
+        self.open_item(version_item)
+
+    def open_version_manager(self, item: DockItem) -> None:
+        origin = self.history_origin_item(item)
+        managers = getattr(self, "version_manager_windows", None)
+        if managers is None:
+            managers = []
+            self.version_manager_windows = managers
+        for manager in list(managers):
+            if getattr(manager, "closed", True):
+                managers.remove(manager)
+                continue
+            if str(getattr(getattr(manager, "item", None), "id", "")) != str(origin.id):
+                continue
+            manager.refresh()
+            try:
+                manager.window.deiconify()
+                manager.window.lift()
+                manager.window.focus_force()
+                self.keep_window_above_main(manager.window)
+            except tk.TclError:
+                pass
+            return
+        manager = VersionHistoryManagerWindow(self, origin)
+        if not manager.closed:
+            managers.append(manager)
+
+    def rebuild_history_menu(self, item: DockItem, selected_items: list[DockItem]) -> None:
+        self.history_menu.delete(0, tk.END)
+        eligible = (
+            len(selected_items) == 1
+            and item.kind not in ("url", "folder", "group", "map_location", BUILTIN_TOOL_KIND)
+        )
+        records = self.version_history_records(item) if eligible else []
+        self.history_menu.add_command(
+            label="版本管理",
+            command=lambda source=item: self.open_version_manager(source),
+            state=(tk.NORMAL if eligible else tk.DISABLED),
+        )
+        self.history_menu.add_separator()
+        if not eligible:
+            self.history_menu.add_command(label="暂无历史版本", state=tk.DISABLED)
+            self.menu.entryconfig(self.history_menu_label, state=tk.DISABLED)
+            return
+        if not records:
+            self.history_menu.add_command(label="暂无历史版本", state=tk.DISABLED)
+            self.menu.entryconfig(self.history_menu_label, state=tk.NORMAL)
+            return
+        for record in reversed(records):
+            label = str(record.get("label") or "历史版本")
+            created = str(record.get("created_at") or "")
+            try:
+                created_label = datetime.fromisoformat(created).strftime("%m-%d %H:%M")
+            except ValueError:
+                created_label = ""
+            menu_label = f"{label}  ·  {created_label}" if created_label and created_label not in label else label
+            self.history_menu.add_command(
+                label=menu_label,
+                command=lambda rec=dict(record), source=item: self.open_history_version(source, rec),
+            )
+        self.menu.entryconfig(self.history_menu_label, state=tk.NORMAL)
+
     def show_item_menu(self, event, item: DockItem) -> None:
         if item.id not in self.selected_ids:
             self.selected_ids = {item.id}
@@ -9997,6 +10613,7 @@ class RelayDockApp:
             return
 
         items = self.selected_items()
+        self.rebuild_history_menu(item, items)
         # 「Zotero 打开」仅在选中单个 PDF 文件时才出现在菜单里。
         if self.zotero_menu_label:
             is_pdf = (
@@ -10172,8 +10789,88 @@ class RelayDockApp:
 
     def group_members(self, group_id: str) -> list[DockItem]:
         members = [item for item in self.items if item.group_id == group_id]
-        members.sort(key=lambda it: (it.added_at, it.id))
+        if members and all(item.group_order is not None for item in members):
+            members.sort(key=lambda it: (it.group_order, it.added_at, it.id))
+        else:
+            # Old data has no explicit group order. Preserve its established
+            # joined-time order until the user sorts or drags a member.
+            members.sort(key=lambda it: (it.added_at, it.id))
         return members
+
+    def reorder_group_members(self, group_id: str, ordered_member_ids: list[str]) -> bool:
+        """Persist a complete, gap-free member order for one group."""
+        current = self.group_members(group_id)
+        if not current:
+            return False
+        by_id = {member.id: member for member in current}
+        ordered: list[DockItem] = []
+        seen: set[str] = set()
+        for member_id in ordered_member_ids:
+            member = by_id.get(str(member_id))
+            if member is None or member.id in seen:
+                continue
+            seen.add(member.id)
+            ordered.append(member)
+        ordered.extend(member for member in current if member.id not in seen)
+
+        changed = [member.id for member in ordered] != [member.id for member in current]
+        for index, member in enumerate(ordered):
+            if member.group_order != index:
+                member.group_order = index
+                changed = True
+        return changed
+
+    def move_group_member(self, group_id: str, member_id: str, target_member_id: str) -> bool:
+        """Move a member into another member's displayed slot, shifting the rest."""
+        member_ids = [member.id for member in self.group_members(group_id)]
+        if (
+            member_id == target_member_id
+            or member_id not in member_ids
+            or target_member_id not in member_ids
+        ):
+            return False
+        target_index = member_ids.index(target_member_id)
+        member_ids.remove(member_id)
+        member_ids.insert(min(target_index, len(member_ids)), member_id)
+        return self.reorder_group_members(group_id, member_ids)
+
+    @staticmethod
+    def group_member_filename_sort_key(item: DockItem) -> tuple:
+        if item.kind != "url" and str(item.target or "").strip():
+            filename = Path(item.target).name or item.display_title
+        else:
+            filename = item.display_title
+        folded = str(filename or item.display_title).casefold()
+        natural = tuple(
+            (0, int(part)) if part.isdigit() else (1, part)
+            for part in re.split(r"(\d+)", folded)
+        )
+        return natural, folded, item.display_title.casefold(), item.id
+
+    def sort_group_members_by_filename(self, group_id: str) -> bool:
+        members = sorted(
+            self.group_members(group_id),
+            key=self.group_member_filename_sort_key,
+        )
+        return self.reorder_group_members(group_id, [member.id for member in members])
+
+    def refresh_group_tile(self, group_id: str) -> None:
+        """Refresh only a group's main-grid preview while its overlay stays open."""
+        group = self.item_by_id(group_id)
+        if not self.is_group(group):
+            return
+        widgets = self.tile_widgets.pop(group_id, None)
+        if widgets:
+            try:
+                widgets[0].destroy()
+            except tk.TclError:
+                pass
+        self.tile_signatures.pop(group_id, None)
+        self.tile_photo_refs.pop(group_id, None)
+        self.render_tile(group)
+        self.tile_signatures[group_id] = self.tile_signature(group)
+        self.update_selection_styles(check_broken=False)
+        self._schedule_tile_visibility_refresh()
 
     def is_group(self, item: DockItem | None) -> bool:
         return bool(item) and item.kind == "group"
@@ -10193,14 +10890,17 @@ class RelayDockApp:
             grid_x=col,
             grid_y=row,
         )
-        for member in members:
+        for index, member in enumerate(members):
             member.group_id = group.id
+            member.group_order = index
         self.items.append(group)
         return group
 
     def add_to_group(self, group_id: str, member_ids: list[str]) -> int:
         added = 0
-        remaining_slots = max(0, GROUP_MAX_MEMBERS - len(self.group_members(group_id)))
+        existing = self.group_members(group_id)
+        ordered_ids = [member.id for member in existing]
+        remaining_slots = max(0, GROUP_MAX_MEMBERS - len(existing))
         if remaining_slots <= 0:
             return 0
         for mid in member_ids:
@@ -10209,12 +10909,17 @@ class RelayDockApp:
             member = self.item_by_id(mid)
             if member and not self.is_group(member) and member.group_id != group_id:
                 member.group_id = group_id
+                ordered_ids.append(member.id)
                 added += 1
+        if added:
+            self.reorder_group_members(group_id, ordered_ids)
         return added
 
     def dissolve_group_if_needed(self, group_id: str) -> None:
         """Drop a group once it has fewer than two members; promote leftovers."""
-        if len(self.group_members(group_id)) >= 2:
+        members = self.group_members(group_id)
+        if len(members) >= 2:
+            self.reorder_group_members(group_id, [member.id for member in members])
             return
         self._promote_and_remove_group(group_id)
 
@@ -10232,6 +10937,7 @@ class RelayDockApp:
             first = next(members_iter, None)
             if first is not None:
                 first.group_id = None
+                first.group_order = None
                 first.grid_x, first.grid_y = group.grid_x, group.grid_y
                 occupied.add((first.grid_x, first.grid_y))
             rest = list(members_iter)
@@ -10239,6 +10945,7 @@ class RelayDockApp:
             rest = members
         for member in rest:
             member.group_id = None
+            member.group_order = None
             member.grid_x, member.grid_y = self.first_free_position(occupied)
             occupied.add((member.grid_x, member.grid_y))
         self.items = [it for it in self.items if it.id != group_id]
@@ -10250,6 +10957,7 @@ class RelayDockApp:
         group_id = member.group_id
         occupied = {(it.grid_x or 0, it.grid_y or 0) for it in self.top_level_items()}
         member.group_id = None
+        member.group_order = None
         pinned_position = col is not None and row is not None
         if not pinned_position:
             member.grid_x, member.grid_y = self.first_free_position(occupied)
@@ -10743,9 +11451,9 @@ class RelayDockApp:
             norm_right = [str(path).casefold() for path in right]
         return norm_left == norm_right
 
-    def _selected_copyable_local_paths(self) -> list[str]:
+    def _copyable_local_paths(self, items: list[DockItem]) -> list[str]:
         paths: list[str] = []
-        for item in self.selected_items():
+        for item in items:
             if item.kind in ("url", "group", BUILTIN_TOOL_KIND):
                 continue
             path = Path(item.target)
@@ -10755,6 +11463,9 @@ class RelayDockApp:
             except Exception:
                 continue
         return paths
+
+    def _selected_copyable_local_paths(self) -> list[str]:
+        return self._copyable_local_paths(self.selected_items())
 
     def _store_duplicate_path_for(self, source: Path) -> Path:
         STORE_DIR.mkdir(parents=True, exist_ok=True)
@@ -11694,7 +12405,10 @@ class RelayDockApp:
         )
 
     def copy_selected_target(self) -> None:
-        items = self.selected_items()
+        self.copy_items_target(self.selected_items())
+
+    def copy_items_target(self, items: list[DockItem]) -> None:
+        items = list(items)
         if not items:
             return
         file_paths = []
@@ -11716,7 +12430,7 @@ class RelayDockApp:
             else:
                 fallback_targets.append(item.target)
 
-        self._passer_copy_paths = self._selected_copyable_local_paths()
+        self._passer_copy_paths = self._copyable_local_paths(items)
         if file_paths and copy_paths_to_clipboard(file_paths):
             suffix = "，也可在 Passer 内粘贴生成副本。" if self._passer_copy_paths else "。"
             self.write_status(f"已复制 {len(file_paths)} 个文件/文件夹，可在资源管理器中粘贴{suffix}")
@@ -11748,7 +12462,10 @@ class RelayDockApp:
         return data.decode("utf-8", errors="replace")
 
     def copy_selected_default(self) -> None:
-        items = self.selected_items()
+        self.copy_items_default(self.selected_items())
+
+    def copy_items_default(self, items: list[DockItem]) -> None:
+        items = list(items)
         if not items:
             return
         copied_texts: list[str] = []
@@ -11779,14 +12496,17 @@ class RelayDockApp:
             self.root.clipboard_append(payload)
             self.write_status("已复制文本内容与其他目标地址。")
             return
-        copyable_paths = self._selected_copyable_local_paths()
+        copyable_paths = self._copyable_local_paths(items)
         if copyable_paths and len(copyable_paths) == len(items):
-            self.copy_selected_target()
+            self.copy_items_target(items)
             return
-        self.copy_selected_paths()
+        self.copy_items_paths(items)
 
     def copy_selected_paths(self) -> None:
-        items = self.selected_items()
+        self.copy_items_paths(self.selected_items())
+
+    def copy_items_paths(self, items: list[DockItem]) -> None:
+        items = list(items)
         if not items:
             return
         paths = []
@@ -13190,6 +13910,117 @@ class RelayDockApp:
             cursor="hand2", font=app_font(9),
         ).pack(side=tk.LEFT, padx=(8, 0))
 
+        history_row = tk.Frame(gen, bg=SURFACE_BG)
+        history_row.pack(fill=tk.X, pady=(14, 0))
+        tk.Label(
+            history_row,
+            text="历史版本命名",
+            bg=SURFACE_BG,
+            fg="#111827",
+            anchor=tk.W,
+            font=app_font(10, "bold"),
+        ).pack(side=tk.LEFT)
+        history_mode_local = tk.StringVar(
+            value=HISTORY_NAMING_LABELS.get(self.history_naming_mode, "时间")
+        )
+        history_mode_select = make_select(
+            history_row,
+            history_mode_local,
+            HISTORY_NAMING_OPTIONS,
+            width=210,
+            height=42,
+        )
+        history_mode_select.pack(side=tk.RIGHT)
+
+        history_pattern_local = tk.StringVar(value=self.history_naming_pattern)
+        history_custom_row = tk.Frame(gen, bg=SURFACE_BG)
+        history_custom_fields = tk.Frame(history_custom_row, bg=SURFACE_BG)
+        history_custom_fields.pack(fill=tk.X)
+        tk.Label(
+            history_custom_fields,
+            text="命名规则",
+            bg=SURFACE_BG,
+            fg="#475569",
+            anchor=tk.W,
+            font=app_font(9),
+        ).pack(side=tk.LEFT, padx=(0, 10))
+        history_pattern_entry = tk.Entry(
+            history_custom_fields,
+            textvariable=history_pattern_local,
+            bd=0,
+            relief=tk.FLAT,
+            bg="#f1f5f9",
+            fg="#1f2937",
+            insertbackground="#1f2937",
+            highlightthickness=1,
+            highlightbackground=BORDER,
+            highlightcolor=ACCENT,
+            font=app_font(9),
+        )
+        history_pattern_entry.pack(side=tk.LEFT, fill=tk.X, expand=True, ipady=7)
+
+        def ask_aira_for_history_rule() -> None:
+            history_mode_local.set(HISTORY_NAMING_LABELS[HISTORY_NAMING_CUSTOM])
+            refresh_history_custom_row()
+            self.summon_ai_input()
+            if self.ai_chat is None:
+                messagebox.showinfo("Aira 不可用", "当前无法载入 Aira 对话组件。", parent=dialog)
+                return
+            prompt = (
+                "我想为 Passer 的历史版本设计自定义命名规则。请先询问并确认我的命名偏好，"
+                "再给出规则。可用占位符：{name}、{stem}、{ext}、{date}、{time}、"
+                "{datetime}、{version}。我确认后，请调用 passer_settings_update，设置 "
+                "history_naming_mode 为 custom，并把最终模板写入 history_naming_pattern。"
+                f"当前模板是：{history_pattern_local.get().strip() or DEFAULT_HISTORY_NAMING_PATTERN}"
+            )
+            try:
+                self.ai_chat.entry.delete("1.0", tk.END)
+                self.ai_chat.entry.insert("1.0", prompt)
+                self.ai_chat._update_placeholder()
+                self.ai_chat._update_inline_action_button()
+                self.ai_chat._resize_input_surface()
+                self.ai_chat.focus_input()
+            except Exception:
+                pass
+            dialog.withdraw()
+            self.write_status("已将历史版本命名需求填入 Aira；发送后即可一起设计规则。")
+
+        tk.Button(
+            history_custom_fields,
+            text="与 Aira 创建规则",
+            command=ask_aira_for_history_rule,
+            bd=0,
+            padx=13,
+            pady=7,
+            bg=ACCENT,
+            fg="#ffffff",
+            activebackground=ACCENT_HOVER,
+            activeforeground="#ffffff",
+            cursor="hand2",
+            font=app_font(9),
+        ).pack(side=tk.LEFT, padx=(8, 0))
+        tk.Label(
+            history_custom_row,
+            text="占位符：{stem} {date} {time} {datetime} {version} {ext}",
+            bg=SURFACE_BG,
+            fg=MUTED_FG,
+            anchor=tk.W,
+            font=app_font(8),
+        ).pack(side=tk.BOTTOM, fill=tk.X, pady=(5, 0))
+
+        def refresh_history_custom_row(event=None) -> None:
+            if normalize_history_naming_mode(history_mode_local.get()) == HISTORY_NAMING_CUSTOM:
+                if not history_custom_row.winfo_manager():
+                    history_custom_row.pack(fill=tk.X, pady=(8, 0))
+            else:
+                history_custom_row.pack_forget()
+
+        history_mode_local.trace_add("write", lambda *_args: refresh_history_custom_row())
+        refresh_history_custom_row()
+        dialog._history_naming_mode_var = history_mode_local
+        dialog._history_naming_pattern_var = history_pattern_local
+        dialog._refresh_history_naming_controls = refresh_history_custom_row
+
         # ================= Aira 模型 =================
         pg_ai = tk.Frame(content, bg=SURFACE_BG)
         pages["ai"] = pg_ai
@@ -13199,7 +14030,7 @@ class RelayDockApp:
 
         ai_enabled_local = tk.BooleanVar(value=self.ai_enabled_var.get())
         ai_row = tk.Frame(ai, bg=SURFACE_BG)
-        ai_row.pack(fill=tk.X, pady=(0, 4))
+        ai_row.pack(fill=tk.X, pady=(0, 0))
         tk.Label(ai_row, text="启用 Aira", bg=SURFACE_BG, fg="#111827", anchor=tk.W,
                  font=app_font(10, "bold")).pack(side=tk.LEFT)
         ai_button = tk.Button(ai_row, bd=0, relief=tk.FLAT, padx=16, pady=7,
@@ -13342,24 +14173,12 @@ class RelayDockApp:
         usage_row.pack(fill=tk.X, pady=(10, 0))
         for idx, (u_label, u_key) in enumerate((("今天", "today"), ("本周", "week"), ("本月", "month"))):
             stat = usage_summary.get(u_key, {}) if isinstance(usage_summary, dict) else {}
-            cache_bits = []
-            if int(stat.get("cache_read_tokens", 0) or 0):
-                cache_bits.append(f"命中 {_fmt_tokens(stat.get('cache_read_tokens'))}")
-            if int(stat.get("cache_write_tokens", 0) or 0):
-                cache_bits.append(f"写入 {_fmt_tokens(stat.get('cache_write_tokens'))}")
-            detail = (
-                f"入 {_fmt_tokens(stat.get('input_tokens'))} / 出 {_fmt_tokens(stat.get('output_tokens'))}"
-            )
-            if cache_bits:
-                detail += " / 缓存 " + "、".join(cache_bits)
             card = tk.Frame(usage_row, bg="#f8fafc", highlightthickness=1, highlightbackground=BORDER)
             card.pack(side=tk.LEFT, fill=tk.BOTH, expand=True, padx=(0 if idx == 0 else 8, 0))
             tk.Label(card, text=f"{u_label} (Tokens)", bg="#f8fafc", fg="#64748b", anchor=tk.W,
                      font=app_font(9)).pack(fill=tk.X, padx=12, pady=(10, 0))
             tk.Label(card, text=_fmt_tokens(stat.get("tokens", 0)), bg="#f8fafc", fg=ACCENT,
-                     anchor=tk.W, font=app_font(15, "bold")).pack(fill=tk.X, padx=12, pady=(2, 0))
-            tk.Label(card, text=detail, bg="#f8fafc", fg="#64748b", anchor=tk.W,
-                     font=app_font(8), wraplength=180, justify=tk.LEFT).pack(fill=tk.X, padx=12, pady=(0, 2))
+                     anchor=tk.W, font=app_font(15, "bold")).pack(fill=tk.X, padx=12, pady=(2, 2))
             tk.Label(card, text=f"{int(stat.get('calls', 0) or 0)} 次调用", bg="#f8fafc",
                      fg="#94a3b8", anchor=tk.W, font=app_font(8)).pack(fill=tk.X, padx=12, pady=(0, 10))
 
@@ -13682,6 +14501,19 @@ class RelayDockApp:
                 messagebox.showinfo("无法使用目录", f"无法创建或使用该目录：\n{candidate}\n\n{exc}", parent=dialog)
                 return
 
+            chosen_history_mode = normalize_history_naming_mode(history_mode_local.get())
+            if chosen_history_mode == HISTORY_NAMING_CUSTOM:
+                try:
+                    chosen_history_pattern = validate_history_naming_pattern(history_pattern_local.get())
+                except ValueError as exc:
+                    messagebox.showinfo("历史版本命名无效", str(exc), parent=dialog)
+                    return
+            else:
+                try:
+                    chosen_history_pattern = validate_history_naming_pattern(history_pattern_local.get())
+                except ValueError:
+                    chosen_history_pattern = DEFAULT_HISTORY_NAMING_PATTERN
+
             desired_autostart = autostart_local.get()
             if desired_autostart != self.autostart_var.get():
                 if not set_autostart_enabled(desired_autostart):
@@ -13719,6 +14551,10 @@ class RelayDockApp:
             self.settings["theme_color"] = self.theme_color
             self.settings["background_color"] = self.background_color
             self.settings["background_image"] = self.background_image
+            self.history_naming_mode = chosen_history_mode
+            self.history_naming_pattern = chosen_history_pattern
+            self.settings["history_naming_mode"] = self.history_naming_mode
+            self.settings["history_naming_pattern"] = self.history_naming_pattern
             external_interface_changed = (
                 bool(ai_enabled_local.get() and external_interface_local.get())
                 != bool(self.ai_external_interface_enabled)
@@ -13858,6 +14694,13 @@ class RelayDockApp:
             except Exception:
                 pass
         self.settings = load_settings()
+        self.history_naming_mode = normalize_history_naming_mode(
+            self.settings.get("history_naming_mode")
+        )
+        self.history_naming_pattern = normalize_history_naming_pattern(
+            self.settings.get("history_naming_pattern")
+        )
+        self.version_history = load_version_history()
         self.apply_passer_theme(self.settings.get("theme_color"))
         self.apply_font_size_setting(self.settings.get("font_size"))
         self.apply_background_color(self.settings.get("background_color"))

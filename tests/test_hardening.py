@@ -7,6 +7,7 @@ import sys
 import tempfile
 import threading
 import time
+import types
 import unittest
 from pathlib import Path
 from unittest import mock
@@ -57,6 +58,47 @@ class _QueuedRoot:
         return f"idle-{len(self.callbacks)}"
 
 
+class _FocusWindow:
+    def __init__(self):
+        self.current_focus = None
+        self.scheduled: list[int | str] = []
+
+    def state(self):
+        return "normal"
+
+    def focus_get(self):
+        return self.current_focus
+
+    def after_idle(self, callback):
+        self.scheduled.append("idle")
+        callback()
+
+    def after(self, delay, callback):
+        self.scheduled.append(delay)
+        callback()
+
+    def __str__(self):
+        return ".focus-window"
+
+
+class _FocusTarget:
+    def __init__(self, window: _FocusWindow):
+        self.window = window
+        self.focus_set_count = 0
+        self.focus_force_count = 0
+
+    def winfo_exists(self):
+        return True
+
+    def focus_set(self):
+        self.focus_set_count += 1
+        self.window.current_focus = self
+
+    def focus_force(self):
+        self.focus_force_count += 1
+        self.window.current_focus = self
+
+
 class _DummyApp:
     def __init__(self, store_dir: Path):
         self.root = _DummyRoot()
@@ -66,6 +108,87 @@ class _DummyApp:
 
     def write_status(self, message: str) -> None:
         self.status.append(message)
+
+
+class FocusRecoveryTests(unittest.TestCase):
+    def test_focus_claim_is_not_dropped_during_foreground_transition(self):
+        window = _FocusWindow()
+        target = _FocusTarget(window)
+        manager = Passer.PasserFocusManager.__new__(Passer.PasserFocusManager)
+        manager.root = window
+        manager._claim_generation = {}
+        manager._recovery_generation = {}
+        manager._last_edit_target = {}
+        manager._is_foreground = mock.Mock(return_value=False)
+        manager.activate = mock.Mock()
+
+        with mock.patch.object(Passer.sys, "platform", "linux"):
+            manager.claim(window, target, activate=False)
+
+        self.assertGreater(target.focus_set_count, 0)
+        self.assertGreater(manager.activate.call_count, 0)
+        self.assertIn(180, window.scheduled)
+
+    def test_claim_and_recover_close_the_ime(self):
+        window = _FocusWindow()
+        target = _FocusTarget(window)
+        manager = Passer.PasserFocusManager.__new__(Passer.PasserFocusManager)
+        manager.root = window
+        manager._claim_generation = {}
+        manager._recovery_generation = {}
+        manager._last_edit_target = {}
+        manager._is_foreground = mock.Mock(return_value=True)
+        manager.activate = mock.Mock()
+        manager.neutralize_ime = mock.Mock()
+
+        with mock.patch.object(Passer.sys, "platform", "linux"):
+            manager.claim(window, target, activate=False)
+            manager.recover_from_pointer(window, resolver=lambda: target)
+
+        manager.neutralize_ime.assert_called_with(window)
+        self.assertGreaterEqual(manager.neutralize_ime.call_count, 2)
+
+    def test_neutralize_ime_ignores_missing_window(self):
+        Passer.PasserFocusManager.neutralize_ime(None)
+
+    def test_every_window_pointer_press_closes_the_ime(self):
+        source = Path(Passer.__file__).read_text(encoding="utf-8")
+        bind_start = source.index("    def _bind_events(")
+        bind_end = source.index("    def handle_global_paste(", bind_start)
+        root_bindings = source[bind_start:bind_end]
+        self.assertIn(
+            'self.root.bind_all("<ButtonPress-1>", self._neutralize_ime_on_pointer_press',
+            root_bindings,
+        )
+
+        manager = mock.Mock()
+        app = mock.Mock(focus_manager=manager)
+        window = mock.Mock()
+        widget = mock.Mock()
+        widget.winfo_toplevel.return_value = window
+        event = types.SimpleNamespace(widget=widget)
+        Passer.RelayDockApp._neutralize_ime_on_pointer_press(app, event)
+        manager.neutralize_ime.assert_called_once_with(window)
+
+    def test_main_and_tool_windows_recover_focus_on_release_and_focus_in(self):
+        source = Path(Passer.__file__).read_text(encoding="utf-8")
+        bind_start = source.index("    def _bind_events(")
+        bind_end = source.index("    def handle_global_paste(", bind_start)
+        root_bindings = source[bind_start:bind_end]
+        self.assertIn('self.root.bind("<ButtonRelease-1>"', root_bindings)
+        self.assertIn('self.root.bind("<FocusIn>"', root_bindings)
+
+        owned_start = source.index("    def keep_window_above_main(")
+        owned_end = source.index("    def refresh_transparency_windows(", owned_start)
+        owned_bindings = source[owned_start:owned_end]
+        self.assertIn('window.bind("<ButtonRelease-1>"', owned_bindings)
+        self.assertIn('window.bind("<FocusIn>"', owned_bindings)
+
+        tool_start = source.index("    def place_tool_window_on_passer(")
+        tool_end = source.index("    def start_screenshot(", tool_start)
+        tool_bindings = source[tool_start:tool_end]
+        self.assertIn('window.bind("<ButtonRelease-1>"', tool_bindings)
+        self.assertIn('window.bind("<FocusIn>"', tool_bindings)
 
 
 class AutomationPersistenceTests(unittest.TestCase):
@@ -306,6 +429,26 @@ class SettingsHardeningTests(unittest.TestCase):
         prompt_cache_row = source.index('text="提示缓存"')
         self.assertLess(aira_row, external_row)
         self.assertLess(external_row, prompt_cache_row)
+        self.assertIn('ai_row.pack(fill=tk.X, pady=(0, 0))', source)
+        for row_name in (
+            "external_interface_row",
+            "cache_row",
+            "openclaw_row",
+        ):
+            self.assertIn(
+                f'{row_name}.pack(fill=tk.X, pady=(8, 0))',
+                source,
+            )
+
+    def test_usage_cards_hide_token_breakdown(self):
+        source = Path(Passer.__file__).read_text(encoding="utf-8")
+        usage_start = source.index("# ---------------- 用量统计")
+        usage_end = source.index("divider(ai)", usage_start)
+        usage_block = source[usage_start:usage_end]
+        self.assertNotIn("cache_read_tokens", usage_block)
+        self.assertNotIn("cache_write_tokens", usage_block)
+        self.assertNotIn("text=detail", usage_block)
+        self.assertIn("次调用", usage_block)
 
     def test_json_transaction_rolls_back_every_file(self):
         with tempfile.TemporaryDirectory() as folder:
@@ -568,6 +711,38 @@ class ResponsivenessTests(unittest.TestCase):
             exec(second, second_ns)
             self.assertEqual(first_ns["cached_value"], 42)
             self.assertEqual(second_ns["cached_value"], 42)
+
+    def test_frozen_code_cache_is_kept_inside_passer_data(self):
+        with tempfile.TemporaryDirectory() as folder:
+            root = Path(folder)
+            desktop = root / "Desktop"
+            data_dir = root / "PasserData"
+            local_app_data = root / "LocalAppData"
+            desktop.mkdir()
+            pointer = local_app_data / "Passer" / "datadir.txt"
+            pointer.parent.mkdir(parents=True)
+            pointer.write_text(str(data_dir), encoding="utf-8")
+            legacy = desktop / "__pycache__"
+            legacy.mkdir()
+            old_cache = legacy / "passer_shared_passer_core.test.bin"
+            old_cache.write_bytes(b"cache")
+
+            with (
+                mock.patch.object(Passer, "SCRIPT_DIR", desktop),
+                mock.patch.object(Passer.sys, "frozen", True, create=True),
+                mock.patch.object(Passer.sys, "pycache_prefix", None, create=True),
+                mock.patch.dict(Passer.os.environ, {"LOCALAPPDATA": str(local_app_data)}),
+            ):
+                self.assertEqual(Passer._passer_code_cache_dir(), data_dir / "Cache")
+                self.assertEqual(
+                    Passer._configure_frozen_python_cache(),
+                    data_dir / "Cache" / "Python",
+                )
+                Passer._migrate_legacy_passer_code_cache()
+                self.assertEqual(Passer.sys.pycache_prefix, str(data_dir / "Cache" / "Python"))
+
+            self.assertFalse(legacy.exists())
+            self.assertEqual((data_dir / "Cache" / old_cache.name).read_bytes(), b"cache")
 
 
 class ShutdownHardeningTests(unittest.TestCase):

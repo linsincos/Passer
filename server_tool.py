@@ -617,7 +617,7 @@ class ServerService:
 class ServerWindow:
     CHROME_TOP = 46
     CHROME_BOTTOM = 16
-    WIDTH = 820
+    WIDTH = 940
     HEIGHT = 710
 
     def __init__(self, app, theme: ClickerTheme):
@@ -725,20 +725,30 @@ class ServerWindow:
             widget.bind("<ButtonPress-1>", self.start_move)
             widget.bind("<B1-Motion>", self.do_move)
 
-    def _section(self, parent, title: str) -> tk.LabelFrame:
-        frame = tk.LabelFrame(
+    def _section(self, parent, title: str) -> tk.Frame:
+        card = tk.Frame(
             parent,
+            bg=self.theme.surface_bg,
+            bd=0,
+            relief=tk.FLAT,
+            highlightthickness=1,
+            highlightbackground=self.theme.border,
+            highlightcolor=self.theme.border,
+        )
+        card.pack(fill=tk.X, pady=(0, 6))
+        tk.Label(
+            card,
             text=title,
             bg=self.theme.surface_bg,
             fg="#111827",
+            anchor=tk.W,
             font=self._font(10, "bold"),
-            bd=1,
-            relief=tk.SOLID,
-            padx=12,
-            pady=8,
-        )
-        frame.pack(fill=tk.X, pady=(0, 10))
-        frame.grid_columnconfigure(1, weight=1)
+        ).pack(fill=tk.X, padx=14, pady=(7, 3))
+        frame = tk.Frame(card, bg=self.theme.surface_bg, bd=0)
+        frame.pack(fill=tk.X, padx=14, pady=(0, 5))
+        frame._passer_card = card
+        frame.grid_columnconfigure(1, weight=3, minsize=480)
+        frame.grid_columnconfigure(3, weight=1, minsize=120)
         return frame
 
     def _label(self, parent, text: str, row: int, column: int = 0):
@@ -750,20 +760,61 @@ class ServerWindow:
             anchor=tk.W,
             font=self._font(9),
         )
-        label.grid(row=row, column=column, sticky="w", padx=(0, 8), pady=4)
+        label.grid(row=row, column=column, sticky="w", padx=(0, 8), pady=2)
         return label
 
     def _entry(self, parent, variable, row: int, column: int = 1, width: int = 20):
-        entry = tk.Entry(
+        field = tk.Frame(
             parent,
+            bg="#ffffff",
+            bd=0,
+            relief=tk.FLAT,
+            highlightthickness=1,
+            highlightbackground=self.theme.border,
+            highlightcolor=self.theme.accent,
+        )
+        field.grid(row=row, column=column, sticky="ew", pady=2)
+        entry = tk.Entry(
+            field,
             textvariable=variable,
             width=width,
-            bd=1,
-            relief=tk.SOLID,
+            bd=0,
+            relief=tk.FLAT,
+            bg="#ffffff",
+            fg="#1f2937",
+            insertbackground="#1f2937",
+            selectbackground=self.theme.accent,
+            selectforeground="#ffffff",
+            disabledbackground="#f1f5f9",
+            disabledforeground="#94a3b8",
+            readonlybackground="#ffffff",
             highlightthickness=0,
+            takefocus=True,
+            cursor="xterm",
             font=self._font(9),
         )
-        entry.grid(row=row, column=column, sticky="ew", pady=4)
+        entry.pack(fill=tk.BOTH, expand=True, padx=7, pady=3)
+
+        def focus_entry(_event=None) -> None:
+            try:
+                if str(entry.cget("state")) not in ("disabled", "readonly"):
+                    self.window.focus_force()
+                    entry.focus_force()
+            except tk.TclError:
+                pass
+
+        field.bind("<ButtonPress-1>", focus_entry)
+        entry.bind("<ButtonRelease-1>", focus_entry, add="+")
+        entry.bind(
+            "<FocusIn>",
+            lambda _event: field.configure(highlightbackground=self.theme.accent),
+            add="+",
+        )
+        entry.bind(
+            "<FocusOut>",
+            lambda _event: field.configure(highlightbackground=self.theme.border),
+            add="+",
+        )
         return entry
 
     def _button(self, parent, text: str, command, *, primary=False, width=11):
@@ -774,7 +825,7 @@ class ServerWindow:
             width=width,
             bd=0,
             padx=8,
-            pady=7,
+            pady=5,
             bg=self.theme.accent if primary else "#eef2f9",
             fg="#ffffff" if primary else "#1f2937",
             activebackground=self.theme.accent_hover if primary else "#e2e8f4",
@@ -785,20 +836,34 @@ class ServerWindow:
         )
 
     def _build_body(self) -> None:
-        body = tk.Frame(self.shell, bg=self.theme.surface_bg)
-        body.pack(side=tk.TOP, fill=tk.BOTH, expand=True, padx=18, pady=14)
+        body = tk.Frame(self.shell, bg=self.theme.app_bg)
+        body.pack(side=tk.TOP, fill=tk.BOTH, expand=True, padx=20, pady=(10, 8))
+
+        # Reserve the action row before packing the variable-height content so
+        # the log and controls cannot be pushed below the fixed window edge.
+        actions = tk.Frame(body, bg=self.theme.app_bg)
+        actions.pack(side=tk.BOTTOM, fill=tk.X, pady=(4, 0))
+        self.open_button = self._button(actions, "打开地址", self.open_address)
+        self.open_button.pack(side=tk.LEFT)
+        self.copy_button = self._button(actions, "复制地址", self.copy_address)
+        self.copy_button.pack(side=tk.LEFT, padx=(8, 0))
+        self.stop_button = self._button(actions, "停止", self.stop_server)
+        self.stop_button.pack(side=tk.RIGHT)
+        self.start_button = self._button(
+            actions, "启动服务器", self.start_server, primary=True, width=13
+        )
+        self.start_button.pack(side=tk.RIGHT, padx=(0, 8))
 
         local = self._section(body, "本地静态服务器")
         self._label(local, "网页目录", 0)
         self._entry(local, self.root_var, 0)
         self._button(local, "选择目录", self.choose_root, width=10).grid(
-            row=0, column=2, padx=(8, 0), pady=4
+            row=0, column=2, padx=(8, 0), pady=2
         )
         self._label(local, "监听地址", 1)
         self._entry(local, self.bind_var, 1)
         self._label(local, "端口", 1, 2)
-        port_entry = self._entry(local, self.port_var, 1, 3, width=8)
-        port_entry.grid_configure(sticky="w", padx=(0, 0))
+        self._entry(local, self.port_var, 1, 3, width=10)
         hint = tk.Label(
             local,
             text="127.0.0.1 仅本机；0.0.0.0 允许局域网设备访问。",
@@ -821,7 +886,7 @@ class ServerWindow:
             selectcolor=self.theme.surface_bg,
             font=self._font(9, "bold"),
         )
-        check.grid(row=0, column=0, sticky="w", pady=(0, 4))
+        check.grid(row=0, column=0, sticky="w", pady=(0, 2))
         gateway_note = tk.Label(
             gateway,
             text="使用 Windows OpenSSH；密码仅在连接时输入，不保存，也不开放远程命令。",
@@ -836,17 +901,15 @@ class ServerWindow:
         self.gateway_host_entry = self._entry(gateway, self.gateway_host_var, 1)
         self._label(gateway, "SSH 端口", 1, 2)
         self.gateway_ssh_port_entry = self._entry(
-            gateway, self.gateway_ssh_port_var, 1, 3, width=8
+            gateway, self.gateway_ssh_port_var, 1, 3, width=10
         )
-        self.gateway_ssh_port_entry.grid_configure(sticky="w")
 
         self._label(gateway, "SSH 用户", 2)
         self.gateway_user_entry = self._entry(gateway, self.gateway_user_var, 2)
         self._label(gateway, "远端地址", 2, 2)
         self.gateway_remote_address_entry = self._entry(
-            gateway, self.gateway_remote_address_var, 2, 3, width=12
+            gateway, self.gateway_remote_address_var, 2, 3, width=16
         )
-        self.gateway_remote_address_entry.grid_configure(sticky="w")
 
         self._label(gateway, "认证方式", 3)
         self.gateway_auth_combo = ttk.Combobox(
@@ -854,10 +917,10 @@ class ServerWindow:
             textvariable=self.gateway_auth_var,
             values=tuple(GATEWAY_AUTH_LABELS.values()),
             state="readonly",
-            width=24,
+            width=30,
             font=self._font(9),
         )
-        self.gateway_auth_combo.grid(row=3, column=1, sticky="ew", pady=4)
+        self.gateway_auth_combo.grid(row=3, column=1, sticky="ew", pady=2)
         self.gateway_auth_combo.bind(
             "<<ComboboxSelected>>",
             lambda _event: self._refresh_gateway_entries(),
@@ -872,7 +935,7 @@ class ServerWindow:
         self.gateway_key_button = self._button(
             gateway, "选择私钥", self.choose_key, width=10
         )
-        self.gateway_key_button.grid(row=5, column=2, padx=(8, 0), pady=4)
+        self.gateway_key_button.grid(row=5, column=2, padx=(8, 0), pady=2)
         public_note = tk.Label(
             gateway,
             text="远端地址填 0.0.0.0 可申请公开端口；SSH 服务器需启用 GatewayPorts。",
@@ -901,46 +964,33 @@ class ServerWindow:
             anchor=tk.W,
             font=self._font(9, "bold"),
         )
-        status_label.grid(row=0, column=1, columnspan=3, sticky="ew", pady=4)
+        status_label.grid(row=0, column=1, columnspan=3, sticky="ew", pady=2)
         self._label(state, "访问地址", 1)
-        address = tk.Entry(
-            state,
-            textvariable=self.address_var,
-            state="readonly",
-            readonlybackground="#f8fafc",
-            fg="#1f2937",
-            bd=1,
-            relief=tk.SOLID,
-            font=self._font(9),
-        )
-        address.grid(row=1, column=1, columnspan=3, sticky="ew", pady=4)
+        address = self._entry(state, self.address_var, 1)
+        address.master.grid_configure(columnspan=3)
+        address.configure(state="readonly")
 
         log_frame = self._section(body, "访问日志")
+        log_frame._passer_card.pack_configure(fill=tk.BOTH, expand=True)
+        log_frame.pack_configure(fill=tk.BOTH, expand=True)
+        log_frame.grid_rowconfigure(0, weight=1)
         self.log_text = tk.Text(
             log_frame,
-            height=5,
+            height=3,
             wrap=tk.WORD,
             state=tk.DISABLED,
-            bg="#f8fafc",
+            bg="#ffffff",
             fg="#334155",
-            bd=1,
-            relief=tk.SOLID,
+            bd=0,
+            relief=tk.FLAT,
+            highlightthickness=1,
+            highlightbackground=self.theme.border,
+            highlightcolor=self.theme.accent,
+            padx=7,
+            pady=4,
             font=self._font(8),
         )
-        self.log_text.grid(row=0, column=0, columnspan=4, sticky="ew")
-
-        actions = tk.Frame(body, bg=self.theme.surface_bg)
-        actions.pack(side=tk.BOTTOM, fill=tk.X)
-        self.open_button = self._button(actions, "打开地址", self.open_address)
-        self.open_button.pack(side=tk.LEFT)
-        self.copy_button = self._button(actions, "复制地址", self.copy_address)
-        self.copy_button.pack(side=tk.LEFT, padx=(8, 0))
-        self.stop_button = self._button(actions, "停止", self.stop_server)
-        self.stop_button.pack(side=tk.RIGHT)
-        self.start_button = self._button(
-            actions, "启动服务器", self.start_server, primary=True, width=13
-        )
-        self.start_button.pack(side=tk.RIGHT, padx=(0, 8))
+        self.log_text.grid(row=0, column=0, columnspan=4, sticky="nsew")
 
         bottom = tk.Frame(self.shell, bg=self.theme.title_bg, height=self.CHROME_BOTTOM)
         bottom.pack(side=tk.BOTTOM, fill=tk.X)

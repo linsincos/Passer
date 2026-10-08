@@ -135,6 +135,36 @@ class ServerConfigTests(unittest.TestCase):
             self.assertNotIn("password", payload)
 
 
+class ServerWindowStyleTests(unittest.TestCase):
+    def test_window_uses_wide_passer_theme_fields_without_black_borders(self):
+        self.assertGreaterEqual(server_tool.ServerWindow.WIDTH, 900)
+        source = Path(server_tool.__file__).read_text(encoding="utf-8")
+        section_start = source.index("    def _section(")
+        section_end = source.index("    def _label(", section_start)
+        section = source[section_start:section_end]
+        self.assertIn("relief=tk.FLAT", section)
+        self.assertIn("highlightbackground=self.theme.border", section)
+        self.assertNotIn("relief=tk.SOLID", section)
+        self.assertNotIn("tk.LabelFrame", section)
+        self.assertIn("pady=(7, 3)", section)
+
+        entry_start = source.index("    def _entry(")
+        entry_end = source.index("    def _button(", entry_start)
+        entry = source[entry_start:entry_end]
+        self.assertIn("highlightbackground=self.theme.border", entry)
+        self.assertIn("highlightcolor=self.theme.accent", entry)
+        self.assertNotIn("relief=tk.SOLID", entry)
+        self.assertIn("padx=7, pady=3", entry)
+        self.assertIn('entry.bind("<ButtonRelease-1>", focus_entry', entry)
+
+        body_start = source.index("    def _build_body(")
+        body_end = source.index("    def _refresh_gateway_entries(", body_start)
+        body = source[body_start:body_end]
+        self.assertLess(body.index("actions = tk.Frame"), body.index("local = self._section"))
+        self.assertIn("log_frame._passer_card.pack_configure(fill=tk.BOTH, expand=True)", body)
+        self.assertIn("height=3", body)
+
+
 class StaticServerTests(unittest.TestCase):
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory()

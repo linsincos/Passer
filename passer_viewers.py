@@ -441,14 +441,18 @@ class ImageViewer:
         self.crop_anchor = None
         self.crop_rect_id = None
         self.crop_box = None
-        # 图片取字（OCR）：微信式框选复制文字。
-        self.ocr_mode = False
+        # 图片文字层：查看模式下后台 OCR，像微信一样直接拖选并复制；
+        # 编辑模式不响应文字选择，避免与批注手势冲突。
         self.ocr_busy = False
         self.ocr_words: list = []
         self.ocr_image_key = None
         self.ocr_sel_anchor = None
         self.ocr_sel_focus = None
-        self._ocr_result = None
+        self.ocr_selecting = False
+        self.ocr_hover_index = None
+        self._ocr_generation = 0
+        self._ocr_results = queue.Queue()
+        self._ocr_poll_after_id = None
 
         self.window = tk.Toplevel(app.root)
         self.window.withdraw()
@@ -469,8 +473,7 @@ class ImageViewer:
         self._button(left, "原始", self.actual_size).pack(side=tk.LEFT, padx=(0, 6), pady=8)
         self.edit_button = self._button(left, "编辑", self.toggle_edit)
         self.edit_button.pack(side=tk.LEFT, padx=(0, 6), pady=8)
-        self.ocr_button = self._button(left, "取字", self.toggle_ocr)
-        self.ocr_button.pack(side=tk.LEFT, padx=(0, 12), pady=8)
+        self._button(left, "另存为新版本", self.save_as_new_version).pack(side=tk.LEFT, padx=(0, 6), pady=8)
         self._button(left, "上一张", self.previous_image).pack(side=tk.LEFT, padx=(0, 6), pady=8)
         self._button(left, "下一张", self.next_image).pack(side=tk.LEFT, padx=(0, 6), pady=8)
         self.photoshop_button = self._button(left, "使用PS打开", self.open_current_with_photoshop)
@@ -523,9 +526,15 @@ class ImageViewer:
         self.canvas.bind("<B1-Motion>", self.on_drag)
         self.canvas.bind("<ButtonRelease-1>", self.on_release)
         self.canvas.bind("<Double-Button-1>", self.on_double_click)
+        self.canvas.bind("<Motion>", self._ocr_on_motion)
+        self.canvas.bind("<Leave>", self._ocr_on_leave)
         self.canvas.bind("<Button-3>", self._ocr_context_menu)
+        self.canvas.bind("<Control-c>", self._ocr_copy_shortcut)
+        self.canvas.bind("<Control-C>", self._ocr_copy_shortcut)
         self.window.bind("<Control-c>", self._ocr_copy_shortcut)
         self.window.bind("<Control-C>", self._ocr_copy_shortcut)
+        self.window.bind("<Control-a>", self._ocr_select_all_shortcut)
+        self.window.bind("<Control-A>", self._ocr_select_all_shortcut)
         self.window.bind("<Escape>", self.on_escape)
         self.window.bind("<Left>", lambda event: self.previous_image())
         self.window.bind("<Right>", lambda event: self.next_image())
@@ -612,15 +621,14 @@ class ImageViewer:
 
         self.update_photoshop_button()
         self.annotator.model.clear()
-        # 切换图片后清空上一张的取字结果与选区。
-        self.ocr_mode = False
+        # 切换图片后清空上一张的文字层与选区；新图在渲染完成后后台识别。
         self.ocr_words = []
         self.ocr_image_key = None
         self.ocr_sel_anchor = None
         self.ocr_sel_focus = None
-        if getattr(self, "ocr_button", None) is not None:
-            self.ocr_button.configure(text="取字")
-            self.canvas.configure(cursor="")
+        self.ocr_selecting = False
+        self.ocr_hover_index = None
+        self.canvas.configure(cursor="")
         self.scale = 1.0
         self.fit_mode = False
         if not self._sized:
@@ -628,6 +636,7 @@ class ImageViewer:
             self._sized = True
         self._center_image()
         self.render()
+        self._ensure_ocr_for_current_image()
 
     def _size_window_to_image(self) -> None:
         if self.image is None:
@@ -708,18 +717,21 @@ class ImageViewer:
 
     # -- pointer (pan vs. annotate) -----------------------------------
     def on_press(self, event) -> None:
-        if self.ocr_mode:
-            self._ocr_on_press(event)
-            return
         if self.crop_mode:
             self._crop_on_press(event)
             return
         if self.edit_mode and self.annotator.on_press(event):
             return
+        if not self.edit_mode and self._ocr_on_press(event):
+            return
+        if not self.edit_mode and self._ocr_selected_range() is not None:
+            self.ocr_sel_anchor = None
+            self.ocr_sel_focus = None
+            self.render()
         self.pan_start = (event.x, event.y, self.image_center[0], self.image_center[1])
 
     def on_drag(self, event) -> None:
-        if self.ocr_mode:
+        if self.ocr_selecting:
             self._ocr_on_drag(event)
             return
         if self.crop_mode:
@@ -735,7 +747,8 @@ class ImageViewer:
         self.render()
 
     def on_release(self, event) -> None:
-        if self.ocr_mode:
+        if self.ocr_selecting:
+            self._ocr_on_release(event)
             return
         if self.crop_mode:
             self._crop_on_release(event)
@@ -745,13 +758,19 @@ class ImageViewer:
         self.pan_start = None
 
     def on_double_click(self, event) -> None:
+        if not self.edit_mode and self._ocr_word_at(event, nearest=False) is not None:
+            self._ocr_on_press(event)
+            self._ocr_on_release(event)
+            return
         if not self.edit_mode:
             self.fit_image()
 
     def on_escape(self, event=None) -> None:
-        if self.ocr_mode:
-            self._exit_ocr_mode()
-            self.app.write_status("已退出取字。")
+        if not self.edit_mode and self._ocr_selected_range() is not None:
+            self.ocr_sel_anchor = None
+            self.ocr_sel_focus = None
+            self.ocr_selecting = False
+            self.render()
         elif self.crop_mode:
             self._exit_crop_mode()
             self.app.write_status("已取消裁剪。")
@@ -781,11 +800,13 @@ class ImageViewer:
 
     # -- edit mode -----------------------------------------------------
     def toggle_edit(self) -> None:
-        if self.ocr_mode:
-            self._exit_ocr_mode()
         self.edit_mode = not self.edit_mode
         self.annotator.set_enabled(self.edit_mode)
         if self.edit_mode:
+            self.ocr_sel_anchor = None
+            self.ocr_sel_focus = None
+            self.ocr_selecting = False
+            self.ocr_hover_index = None
             self.edit_bar.pack(side=tk.TOP, fill=tk.X, before=self.canvas)
             self.edit_ops_bar.pack(side=tk.TOP, fill=tk.X, before=self.canvas)
             self.canvas.configure(cursor="pencil")
@@ -795,6 +816,8 @@ class ImageViewer:
             self.edit_ops_bar.pack_forget()
             self.canvas.configure(cursor="")
         self.render()
+        if not self.edit_mode:
+            self._ensure_ocr_for_current_image()
 
     def flattened_image(self) -> "Image.Image":
         if self.annotator.model.is_empty():
@@ -808,6 +831,25 @@ class ImageViewer:
             self.app.write_status("已复制图片到剪贴板。")
         else:
             self.app.write_status("复制图片失败。")
+
+    def save_as_new_version(self) -> None:
+        if self.image is None:
+            return
+        item = self.current_item()
+        source = Path(item.target)
+        suffix = ".png" if source.suffix.lower() == ".psd" else (source.suffix or ".png")
+
+        def writer(destination: Path) -> None:
+            flat = self.flattened_image()
+            ext = destination.suffix.lower()
+            if ext in (".jpg", ".jpeg"):
+                self._flatten_alpha(flat).save(destination, "JPEG", quality=95)
+            elif ext == ".png":
+                flat.save(destination, "PNG")
+            else:
+                flat.save(destination)
+
+        self.app.save_item_as_new_version(item, writer=writer, suffix=suffix)
 
     def save_edits(self) -> None:
         if self.image is None:
@@ -852,8 +894,6 @@ class ImageViewer:
             self._enter_crop_mode()
 
     def _enter_crop_mode(self) -> None:
-        if self.ocr_mode:
-            self._exit_ocr_mode()
         self.crop_mode = True
         self.crop_anchor = None
         self.crop_box = None
@@ -917,96 +957,93 @@ class ImageViewer:
             f"已框选 {self.crop_box[2] - self.crop_box[0]}×{self.crop_box[3] - self.crop_box[1]}，"
             "点「应用裁剪」确认。")
 
-    # -- 图片取字 (OCR) ------------------------------------------------
-    def toggle_ocr(self) -> None:
-        if self.image is None:
+    # -- 图片文字层 (OCR) ---------------------------------------------
+    def _ensure_ocr_for_current_image(self, *, force: bool = False) -> None:
+        """在后台准备当前图片的文字层，不阻塞图片窗口首次显示。"""
+        if self.closed or self.image is None or self.edit_mode:
             return
-        if self.ocr_mode:
-            self._exit_ocr_mode()
-            self.app.write_status("已退出取字。")
-            return
-        module = _ensure_ocr()
-        if module is None or not module.ocr_available():
-            reason = module.unavailable_reason() if module is not None else "OCR 模块加载失败。"
-            messagebox.showinfo("无法取字", reason, parent=self.window)
-            return
-        if self.edit_mode:
-            self.toggle_edit()
-        if self.crop_mode:
-            self._exit_crop_mode()
-        self.ocr_mode = True
-        self.ocr_sel_anchor = None
-        self.ocr_sel_focus = None
-        self.ocr_button.configure(text="退出取字")
-        self.canvas.configure(cursor="xterm")
         key = id(self.image)
-        if self.ocr_image_key == key and self.ocr_words:
-            # 复用上次识别结果，免去重复 OCR。
-            self.render()
-            self.app.write_status("拖动框选文字，右键或 Ctrl+C 复制。")
-        else:
-            self.ocr_words = []
-            self.render()
-            self._start_ocr(key)
-
-    def _exit_ocr_mode(self) -> None:
-        self.ocr_mode = False
-        self.ocr_sel_anchor = None
-        self.ocr_sel_focus = None
-        if getattr(self, "ocr_button", None) is not None:
-            self.ocr_button.configure(text="取字")
-        self.canvas.configure(cursor="pencil" if self.edit_mode else "")
-        self.render()
+        if not force and self.ocr_image_key == key:
+            return
+        self._start_ocr(key)
 
     def _start_ocr(self, key) -> None:
-        if self.ocr_busy:
+        image = self.image
+        if image is None:
             return
-        module = _ensure_ocr()
-        if module is None:
-            return
+        self._ocr_generation += 1
+        generation = self._ocr_generation
         self.ocr_busy = True
-        self.app.write_status("正在识别文字…")
-        image = self.image.copy()
-        self._ocr_result = None
+        self.app.write_status("正在后台识别图片文字…")
 
         def work() -> None:
+            status = "ready"
+            words = []
             try:
-                words = module.recognize_words(image)
+                module = _ensure_ocr()
+                if module is None or not module.ocr_available():
+                    status = "unavailable"
+                else:
+                    words = module.recognize_words(image)
             except Exception:
+                status = "error"
                 words = []
-            # Tk 非线程安全：工作线程只写结果，交由主线程轮询取走，
-            # 切勿在此调用 after()/任何控件方法。
-            self._ocr_result = (words, key)
+            # Tk 非线程安全：工作线程只把结果放入队列，控件更新由主线程轮询。
+            self._ocr_results.put((generation, key, words, status))
 
         threading.Thread(target=work, daemon=True).start()
-        self._ocr_poll()
+        self._schedule_ocr_poll()
+
+    def _schedule_ocr_poll(self) -> None:
+        if self.closed or self._ocr_poll_after_id is not None:
+            return
+        self._ocr_poll_after_id = self.window.after(80, self._ocr_poll)
 
     def _ocr_poll(self) -> None:
+        self._ocr_poll_after_id = None
         if self.closed:
             return
-        result = self._ocr_result
-        if result is None:
-            self.window.after(80, self._ocr_poll)
-            return
-        self._ocr_result = None
-        words, key = result
-        self._ocr_ready(words, key)
+        current = None
+        while True:
+            try:
+                result = self._ocr_results.get_nowait()
+            except queue.Empty:
+                break
+            if result[0] == self._ocr_generation:
+                current = result
+        if current is not None:
+            generation, key, words, status = current
+            self._ocr_ready(generation, key, words, status)
+        if self.ocr_busy:
+            self._schedule_ocr_poll()
 
-    def _ocr_ready(self, words, key) -> None:
+    def _ocr_ready(self, generation, key, words, status: str) -> None:
+        if generation != self._ocr_generation:
+            return
         self.ocr_busy = False
-        if self.closed or not self.ocr_mode:
+        if self.closed or self.image is None or id(self.image) != key:
             return
-        if self.image is None or id(self.image) != key:
-            return
-        self.ocr_words = words
+        self.ocr_words = list(words)
         self.ocr_image_key = key
         self.ocr_sel_anchor = None
         self.ocr_sel_focus = None
-        if words:
-            self.app.write_status(f"识别到 {len(words)} 处文字，拖动框选后右键或 Ctrl+C 复制。")
-        else:
-            self.app.write_status("未识别到文字。")
-        self.render()
+        self.ocr_selecting = False
+        self.ocr_hover_index = None
+        if status == "ready" and words:
+            self.app.write_status("可直接拖选图片中的文字，按 Ctrl+C 复制。")
+        elif status == "error":
+            self.app.write_status("图片文字识别失败，可右键重新识别。")
+        if not self.edit_mode:
+            self.render()
+
+    def _refresh_ocr(self) -> None:
+        if self.image is None or self.edit_mode:
+            return
+        self.ocr_sel_anchor = None
+        self.ocr_sel_focus = None
+        self.ocr_selecting = False
+        self.ocr_hover_index = None
+        self._ensure_ocr_for_current_image(force=True)
 
     def _ocr_word_at(self, event, nearest: bool = False):
         """画布坐标 → 命中的文字单元索引；nearest=True 时返回最近的单元。"""
@@ -1031,15 +1068,28 @@ class ImageViewer:
                     best = index
         return best if nearest else None
 
-    def _ocr_on_press(self, event) -> None:
+    def _ocr_on_press(self, event) -> bool:
         index = self._ocr_word_at(event, nearest=False)
         if index is None:
-            self.ocr_sel_anchor = None
-            self.ocr_sel_focus = None
-        else:
-            self.ocr_sel_anchor = index
-            self.ocr_sel_focus = index
+            return False
+        self.ocr_sel_anchor = index
+        self.ocr_sel_focus = index
+        self.ocr_selecting = True
+        self.pan_start = None
+        try:
+            self.canvas.focus_set()
+        except tk.TclError:
+            pass
+        # The borderless viewer can receive its click before Windows has fully
+        # reactivated it.  Reuse Passer's focus recovery so Ctrl+C is delivered
+        # to the OCR canvas after selecting text, including on the first click
+        # after switching back from another application.
+        focus_manager = getattr(self.app, "focus_manager", None)
+        claim_focus = getattr(focus_manager, "claim", None)
+        if callable(claim_focus):
+            claim_focus(self.window, self.canvas)
         self.render()
+        return True
 
     def _ocr_on_drag(self, event) -> None:
         index = self._ocr_word_at(event, nearest=True)
@@ -1050,6 +1100,32 @@ class ImageViewer:
         self.ocr_sel_focus = index
         self.render()
 
+    def _ocr_on_release(self, event) -> None:
+        self._ocr_on_drag(event)
+        self.ocr_selecting = False
+        self.pan_start = None
+
+    def _ocr_on_motion(self, event) -> None:
+        if self.edit_mode or self.crop_mode or self.ocr_selecting or self.pan_start:
+            return
+        index = self._ocr_word_at(event, nearest=False)
+        if index == self.ocr_hover_index:
+            return
+        self.ocr_hover_index = index
+        try:
+            self.canvas.configure(cursor="xterm" if index is not None else "")
+        except tk.TclError:
+            pass
+
+    def _ocr_on_leave(self, _event=None) -> None:
+        if self.edit_mode or self.crop_mode or self.ocr_selecting:
+            return
+        self.ocr_hover_index = None
+        try:
+            self.canvas.configure(cursor="")
+        except tk.TclError:
+            pass
+
     def _ocr_selected_range(self):
         if self.ocr_sel_anchor is None or self.ocr_sel_focus is None:
             return None
@@ -1057,39 +1133,38 @@ class ImageViewer:
                 max(self.ocr_sel_anchor, self.ocr_sel_focus))
 
     def _ocr_select_all(self) -> None:
-        if not self.ocr_words:
+        if self.edit_mode or not self.ocr_words:
             return
         self.ocr_sel_anchor = 0
         self.ocr_sel_focus = len(self.ocr_words) - 1
         self.render()
 
     def _draw_ocr_overlay(self) -> None:
-        if not self.ocr_words:
+        selection = self._ocr_selected_range()
+        if self.edit_mode or not self.ocr_words or selection is None:
             return
         scale, ox, oy = self._image_transform()
-        selection = self._ocr_selected_range()
-        for index, word in enumerate(self.ocr_words):
+        for index in range(selection[0], selection[1] + 1):
+            word = self.ocr_words[index]
             x0 = word.x * scale + ox
             y0 = word.y * scale + oy
             x1 = (word.x + word.w) * scale + ox
             y1 = (word.y + word.h) * scale + oy
-            if selection is not None and selection[0] <= index <= selection[1]:
-                self.canvas.create_rectangle(
-                    x0, y0, x1, y1, fill="#38bdf8", outline="#0ea5e9",
-                    width=1, stipple="gray50", tags="ocrov")
-            else:
-                self.canvas.create_rectangle(
-                    x0, y0, x1, y1, outline="#60a5fa", width=1, tags="ocrov")
+            self.canvas.create_rectangle(
+                x0, y0, x1, y1, fill="#38bdf8", outline="#0ea5e9",
+                width=1, stipple="gray50", tags="ocrov")
 
     def _ocr_selected_text(self, all_text: bool = False) -> str:
         module = _ensure_ocr()
         if module is None or not self.ocr_words:
             return ""
         selection = self._ocr_selected_range()
-        if all_text or selection is None:
+        if all_text:
             words = list(self.ocr_words)
-        else:
+        elif selection is not None:
             words = self.ocr_words[selection[0]:selection[1] + 1]
+        else:
+            return ""
         return module.join_words(words)
 
     def _set_clipboard_text(self, text: str) -> None:
@@ -1112,22 +1187,38 @@ class ImageViewer:
         self.app.write_status(f"已复制 {len(text)} 个字符到剪贴板。")
 
     def _ocr_copy_shortcut(self, event=None):
-        if not self.ocr_mode:
+        if self.edit_mode or self._ocr_selected_range() is None:
             return None
         self._ocr_copy(all_text=False)
         return "break"
 
+    def _ocr_select_all_shortcut(self, event=None):
+        if self.edit_mode or not self.ocr_words:
+            return None
+        self._ocr_select_all()
+        return "break"
+
     def _ocr_context_menu(self, event) -> None:
-        if not self.ocr_mode:
+        if self.edit_mode or self.crop_mode:
             return
         has_selection = self._ocr_selected_range() is not None
+        has_words = bool(self.ocr_words)
         menu = tk.Menu(self.window, tearoff=0)
         menu.add_command(
             label="复制所选文字", command=lambda: self._ocr_copy(False),
             state=(tk.NORMAL if has_selection else tk.DISABLED))
-        menu.add_command(label="复制全部文字", command=lambda: self._ocr_copy(True))
+        menu.add_command(
+            label="复制全部文字", command=lambda: self._ocr_copy(True),
+            state=(tk.NORMAL if has_words else tk.DISABLED))
         menu.add_separator()
-        menu.add_command(label="全选", command=self._ocr_select_all)
+        menu.add_command(
+            label="全选文字", command=self._ocr_select_all,
+            state=(tk.NORMAL if has_words else tk.DISABLED))
+        menu.add_command(
+            label=("正在识别文字…" if self.ocr_busy else "重新识别文字"),
+            command=self._refresh_ocr,
+            state=(tk.DISABLED if self.ocr_busy else tk.NORMAL),
+        )
         try:
             menu.tk_popup(event.x_root, event.y_root)
         finally:
@@ -1559,10 +1650,9 @@ class ImageViewer:
         self.canvas.delete("all")
         self.canvas.create_image(draw_x, draw_y, image=self.photo, anchor=anchor)
         self.annotator.render()
-        if self.ocr_mode:
-            self._draw_ocr_overlay()
+        self._draw_ocr_overlay()
         item = self.current_item()
-        suffix = "   [取字中]" if self.ocr_mode else ("   [编辑中]" if self.edit_mode else "")
+        suffix = "   [编辑中]" if self.edit_mode else ("   [正在识别文字]" if self.ocr_busy else "")
         self.info_var.set(
             f"{Path(item.target).name}    {self.image.width} x {self.image.height}    {int(self.scale * 100)}%{suffix}"
         )
@@ -1571,6 +1661,12 @@ class ImageViewer:
         if self.closed:
             return
         self.closed = True
+        if self._ocr_poll_after_id is not None:
+            try:
+                self.window.after_cancel(self._ocr_poll_after_id)
+            except tk.TclError:
+                pass
+            self._ocr_poll_after_id = None
         try:
             if self in self.app.image_viewers:
                 self.app.image_viewers.remove(self)
@@ -1657,6 +1753,7 @@ class PdfViewer:
         self.edit_button.pack(side=tk.LEFT, padx=(0, 12), pady=8)
         self._button(left, "页面", self.show_page_menu).pack(side=tk.LEFT, padx=(0, 6), pady=8)
         self._button(left, "默认程序打开", self.open_external).pack(side=tk.LEFT, padx=(0, 6), pady=8)
+        self._button(left, "另存为新版本", self.save_as_new_version).pack(side=tk.LEFT, padx=(0, 6), pady=8)
 
         self._button(self.toolbar, "×", self.close, close=True).pack(side=tk.RIGHT, padx=(0, 8), pady=8)
 
@@ -2016,6 +2113,31 @@ class PdfViewer:
     def _mark_dirty(self) -> None:
         self.dirty = True
 
+    def _write_annotated_pdf(self, out_path: Path) -> None:
+        pages: list["Image.Image"] = []
+        for i in range(self.page_count):
+            page_pil = self.render_page_image(i)
+            model = self.models.get(i)
+            if model and not model.is_empty():
+                page_pil = self._flatten(model, page_pil, i)
+            pages.append(page_pil.convert("RGB"))
+        if not pages:
+            raise ValueError("PDF 没有可保存的页面。")
+        pages[0].save(out_path, "PDF", save_all=True, append_images=pages[1:])
+
+    def save_as_new_version(self) -> None:
+        if self.doc is None:
+            return
+        if self.has_annotations():
+            self.app.save_item_as_new_version(
+                self.item,
+                writer=self._write_annotated_pdf,
+                suffix=".pdf",
+                source_path=self.source_path,
+            )
+        else:
+            self.app.save_item_as_new_version(self.item, source_path=self.source_path)
+
     def save_edits(self, confirm: bool = True) -> None:
         if self.doc is None:
             return
@@ -2031,14 +2153,7 @@ class PdfViewer:
         ):
             return
         try:
-            pages: list["Image.Image"] = []
-            for i in range(self.page_count):
-                page_pil = self.render_page_image(i)
-                model = self.models.get(i)
-                if model and not model.is_empty():
-                    page_pil = self._flatten(model, page_pil, i)
-                pages.append(page_pil.convert("RGB"))
-            pages[0].save(out_path, "PDF", save_all=True, append_images=pages[1:])
+            self._write_annotated_pdf(out_path)
         except Exception as exc:
             messagebox.showinfo("保存失败", f"无法保存批注 PDF：\n{out_path}\n\n{exc}", parent=self.window)
             return
@@ -2262,6 +2377,7 @@ class TextViewer:
         self._button(left, "A+", lambda: self.change_font(1)).pack(side=tk.LEFT, padx=(0, 6), pady=8)
         self._button(left, "自动换行", self.toggle_wrap).pack(side=tk.LEFT, padx=(0, 6), pady=8)
         self._button(left, "保存", self.save).pack(side=tk.LEFT, padx=(0, 6), pady=8)
+        self._button(left, "另存为新版本", self.save_as_new_version).pack(side=tk.LEFT, padx=(0, 6), pady=8)
         if self.is_code:
             self._button(left, "VS Code", self.open_vscode).pack(side=tk.LEFT, padx=(0, 6), pady=8)
         self._button(left, "默认程序打开", self.open_external).pack(side=tk.LEFT, padx=(0, 6), pady=8)
@@ -2834,6 +2950,23 @@ class TextViewer:
         self._delete_text_autosave()
         self.app.write_status(f"已保存：{self.path.name}")
 
+    def save_as_new_version(self) -> None:
+        if self.truncated:
+            messagebox.showinfo(
+                "无法创建版本",
+                "文件过大，当前只载入了前 4 MB；为避免生成截断版本，已停止保存。",
+                parent=self.window,
+            )
+            return
+        content = self.text.get("1.0", "end-1c")
+        encoding = self.read_encoding if self.read_encoding in ("utf-8-sig", "utf-8", "gbk", "utf-16") else "utf-8"
+        self.app.save_item_as_new_version(
+            self.item,
+            writer=lambda destination: destination.write_text(content, encoding=encoding),
+            suffix=self.path.suffix,
+            source_path=self.path,
+        )
+
     def open_external(self) -> None:
         try:
             if sys.platform == "win32":
@@ -2993,6 +3126,7 @@ class ExcelViewer:
         left = tk.Frame(self.toolbar, bg=TITLE_BG)
         left.pack(side=tk.LEFT, padx=(10, 6))
         self._button(left, "默认程序打开", self.open_external).pack(side=tk.LEFT, padx=(0, 8), pady=8)
+        self._button(left, "另存为新版本", self.save_as_new_version).pack(side=tk.LEFT, padx=(0, 8), pady=8)
         self._button(self.toolbar, "×", self.close, close=True).pack(side=tk.RIGHT, padx=(0, 8), pady=8)
         self.info_var = tk.StringVar(value=self.source_path.name)
         self.info_label = tk.Label(
@@ -3152,6 +3286,9 @@ class ExcelViewer:
             self.app.write_status(f"已用默认程序打开：{self.source_path.name}")
         except Exception as exc:
             messagebox.showinfo("打开失败", f"无法用默认程序打开：\n{self.source_path}\n\n{exc}", parent=self.window)
+
+    def save_as_new_version(self) -> None:
+        self.app.save_item_as_new_version(self.item, source_path=self.source_path)
 
     def start_move(self, event) -> None:
         self.move_start = (event.x_root, event.y_root, self.window.winfo_x(), self.window.winfo_y())
@@ -3957,9 +4094,16 @@ class _FramelessViewer:
         self.toolbar_left.pack(side=tk.LEFT, padx=(10, 6))
         self._button(self.toolbar, "×", self.close, close=True).pack(side=tk.RIGHT, padx=(0, 8), pady=8)
         self.info_var = tk.StringVar(value=title)
-        tk.Label(self.toolbar, textvariable=self.info_var, bg=TITLE_BG, fg="#dbe7ff",
-                 anchor=tk.W).pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(6, 10))
-        for widget in (self.toolbar, self.toolbar_left):
+        self.info_label = tk.Label(
+            self.toolbar,
+            textvariable=self.info_var,
+            bg=TITLE_BG,
+            fg="#dbe7ff",
+            anchor=tk.W,
+            cursor="fleur",
+        )
+        self.info_label.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(6, 10))
+        for widget in (self.toolbar, self.toolbar_left, self.info_label):
             widget.bind("<ButtonPress-1>", self.start_move)
             widget.bind("<B1-Motion>", self.do_move)
         bottom = tk.Frame(self.shell, bg=TITLE_BG, height=self.CHROME_BOTTOM)
@@ -3994,6 +4138,13 @@ class _FramelessViewer:
         button.bind("<Enter>", lambda _e: button.configure(bg=hover))
         button.bind("<Leave>", lambda _e: button.configure(bg=TITLE_BUTTON_BG))
         return button
+
+    def save_source_as_new_version(self) -> None:
+        item = getattr(self, "item", None)
+        path = getattr(self, "path", None)
+        if item is None or path is None:
+            return
+        self.app.save_item_as_new_version(item, source_path=path)
 
     def start_move(self, event) -> None:
         self.move_start = (event.x_root, event.y_root, self.window.winfo_x(), self.window.winfo_y())
@@ -4036,6 +4187,254 @@ class _FramelessViewer:
         return []
 
 
+class VersionHistoryManagerWindow(_FramelessViewer):
+    """Passer-styled, item-specific history version management window."""
+
+    MIN_W = 780
+    MIN_H = 520
+
+    def __init__(self, app, item: DockItem):
+        self.item = app.history_origin_item(item)
+        body = self._build_frame(app, f"版本管理 · {self.item.display_title}")
+        self._button(
+            self.toolbar_left,
+            "保存当前为新版本",
+            self.save_current_version,
+        ).pack(side=tk.LEFT, padx=(0, 6), pady=8)
+
+        header = tk.Frame(body, bg=SURFACE_BG)
+        header.pack(fill=tk.X, padx=18, pady=(16, 10))
+        tk.Label(
+            header,
+            text=self.item.display_title,
+            bg=SURFACE_BG,
+            fg="#0f172a",
+            anchor=tk.W,
+            font=app_font(12, "bold"),
+        ).pack(side=tk.LEFT, fill=tk.X, expand=True)
+        self.count_var = tk.StringVar()
+        tk.Label(
+            header,
+            textvariable=self.count_var,
+            bg=SURFACE_BG,
+            fg=MUTED_FG,
+            anchor=tk.E,
+            font=app_font(9),
+        ).pack(side=tk.RIGHT)
+        tk.Label(
+            body,
+            text=str(self.item.target),
+            bg=SURFACE_BG,
+            fg=MUTED_FG,
+            anchor=tk.W,
+            font=app_font(8),
+        ).pack(fill=tk.X, padx=18, pady=(0, 10))
+
+        holder = tk.Frame(body, bg=SURFACE_BG)
+        holder.pack(fill=tk.BOTH, expand=True, padx=(18, 8), pady=(0, 14))
+        self.list_canvas = tk.Canvas(holder, bg=SURFACE_BG, highlightthickness=0, bd=0)
+        self.list_scrollbar = ttk.Scrollbar(
+            holder,
+            orient=tk.VERTICAL,
+            command=self.list_canvas.yview,
+        )
+        self.list_canvas.configure(yscrollcommand=self.list_scrollbar.set)
+        self.list_scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
+        self.list_canvas.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        self.list_frame = tk.Frame(self.list_canvas, bg=SURFACE_BG)
+        self.list_window = self.list_canvas.create_window(
+            (0, 0), window=self.list_frame, anchor=tk.NW
+        )
+        self.list_frame.bind("<Configure>", self._sync_scroll_region)
+        self.list_canvas.bind("<Configure>", self._fit_list_width)
+        self.window.bind("<MouseWheel>", self._on_mouse_wheel)
+
+        self.refresh()
+        self._finish_frame()
+
+    def _viewer_list(self):
+        return self.app.version_manager_windows
+
+    def _sync_scroll_region(self, _event=None) -> None:
+        try:
+            self.list_canvas.configure(scrollregion=self.list_canvas.bbox("all"))
+        except tk.TclError:
+            pass
+
+    def _fit_list_width(self, event) -> None:
+        try:
+            self.list_canvas.itemconfigure(self.list_window, width=max(1, event.width))
+        except tk.TclError:
+            pass
+
+    def _on_mouse_wheel(self, event) -> None:
+        try:
+            self.list_canvas.yview_scroll(int(-event.delta / 120), "units")
+        except tk.TclError:
+            pass
+
+    @staticmethod
+    def _created_label(record: dict) -> str:
+        created = str(record.get("created_at") or "")
+        try:
+            return datetime.fromisoformat(created).strftime("%Y-%m-%d %H:%M:%S")
+        except ValueError:
+            return created
+
+    def _action_button(self, parent, text: str, command, *, primary=False, danger=False):
+        if danger:
+            bg, fg, hover = "#fee2e2", "#b91c1c", "#fecaca"
+        elif primary:
+            bg, fg, hover = ACCENT, "#ffffff", ACCENT_HOVER
+        else:
+            bg, fg, hover = "#eaf0f8", "#334155", "#dbe5f2"
+        return tk.Button(
+            parent,
+            text=text,
+            command=command,
+            bd=0,
+            relief=tk.FLAT,
+            padx=11,
+            pady=6,
+            bg=bg,
+            fg=fg,
+            activebackground=hover,
+            activeforeground=fg,
+            cursor="hand2",
+            font=app_font(8),
+        )
+
+    def refresh(self) -> None:
+        if getattr(self, "closed", False):
+            return
+        for child in self.list_frame.winfo_children():
+            child.destroy()
+        records = self.app.version_history_records(self.item)
+        self.count_var.set(f"共 {len(records)} 个历史版本")
+        if not records:
+            empty = tk.Frame(
+                self.list_frame,
+                bg="#f8fafc",
+                highlightthickness=1,
+                highlightbackground=BORDER,
+            )
+            empty.pack(fill=tk.X, padx=(0, 10), pady=4)
+            tk.Label(
+                empty,
+                text="暂无历史版本\n可点击标题栏中的“保存当前为新版本”创建第一个版本。",
+                bg="#f8fafc",
+                fg=MUTED_FG,
+                justify=tk.CENTER,
+                font=app_font(9),
+            ).pack(fill=tk.X, padx=20, pady=34)
+            return
+        for record in reversed(records):
+            self._build_record_card(record)
+
+    def _build_record_card(self, record: dict) -> None:
+        path = history_record_path(record)
+        card = tk.Frame(
+            self.list_frame,
+            bg="#f8fafc",
+            highlightthickness=1,
+            highlightbackground=BORDER,
+        )
+        card.pack(fill=tk.X, padx=(0, 10), pady=4)
+        actions = tk.Frame(card, bg="#f8fafc")
+        actions.pack(side=tk.RIGHT, padx=12, pady=12)
+        self._action_button(
+            actions,
+            "打开",
+            lambda rec=dict(record): self.app.open_history_version(self.item, rec),
+            primary=True,
+        ).pack(side=tk.LEFT, padx=(0, 6))
+        self._action_button(
+            actions,
+            "删除",
+            lambda rec=dict(record): self.delete_record(rec),
+            danger=True,
+        ).pack(side=tk.LEFT)
+
+        details = tk.Frame(card, bg="#f8fafc")
+        details.pack(side=tk.LEFT, fill=tk.BOTH, expand=True, padx=14, pady=10)
+        tk.Label(
+            details,
+            text=str(record.get("label") or "历史版本"),
+            bg="#f8fafc",
+            fg="#0f172a",
+            anchor=tk.W,
+            font=app_font(10, "bold"),
+        ).pack(fill=tk.X)
+        metadata = self._created_label(record)
+        if path is not None:
+            metadata = f"{metadata}  ·  {path.name}" if metadata else path.name
+        tk.Label(
+            details,
+            text=metadata,
+            bg="#f8fafc",
+            fg=MUTED_FG,
+            anchor=tk.W,
+            font=app_font(8),
+        ).pack(fill=tk.X, pady=(4, 0))
+
+    def save_current_version(self) -> None:
+        if self.app.save_item_as_new_version(self.item) is not None:
+            self.refresh()
+
+    def delete_record(self, record: dict) -> None:
+        label = str(record.get("label") or "该历史版本")
+        if not messagebox.askyesno(
+            "删除历史版本",
+            f"确定永久删除“{label}”吗？\n\n此操作不会删除当前文件。",
+            parent=self.window,
+        ):
+            return
+        key = str(self.item.id)
+        original = list(self.app.version_history.get(key, ()))
+        record_id = str(record.get("id") or "")
+        updated = [
+            entry for entry in original
+            if (str(entry.get("id") or "") != record_id if record_id else entry != record)
+        ]
+        path = history_record_path(record)
+        if updated:
+            self.app.version_history[key] = updated
+        else:
+            self.app.version_history.pop(key, None)
+        try:
+            save_version_history(self.app.version_history)
+            if path is not None:
+                make_path_writable(path)
+                path.unlink(missing_ok=True)
+                try:
+                    path.parent.rmdir()
+                except OSError:
+                    pass
+        except Exception as exc:
+            self.app.version_history[key] = original
+            try:
+                save_version_history(self.app.version_history)
+            except Exception:
+                pass
+            self.app._log_unexpected(
+                exc,
+                module="versions",
+                action="delete_history_version",
+                target_path=path or self.item.target,
+                expected=(OSError, ValueError),
+            )
+            messagebox.showinfo(
+                "删除失败",
+                f"无法删除历史版本：\n{path or label}\n\n{exc}",
+                parent=self.window,
+            )
+            return
+        self.app.tile_signatures.pop(key, None)
+        self.app.schedule_render()
+        self.app.write_status(f"已删除历史版本：{label}")
+        self.refresh()
+
+
 class ShellPreviewHandlerViewer(_FramelessViewer):
     """Host Microsoft's Office Preview Handler for instant Office previews."""
 
@@ -4057,6 +4456,7 @@ class ShellPreviewHandlerViewer(_FramelessViewer):
 
         body = self._build_frame(app, self.path.name)
         self._button(self.toolbar_left, "默认程序打开", self.open_external).pack(side=tk.LEFT, padx=(0, 6), pady=8)
+        self._button(self.toolbar_left, "另存为新版本", self.save_source_as_new_version).pack(side=tk.LEFT, padx=(0, 6), pady=8)
         self.host = tk.Frame(body, bg="#ffffff")
         self.host.pack(fill=tk.BOTH, expand=True)
         self.host.bind("<Configure>", self._on_host_configure)
@@ -4201,6 +4601,7 @@ class MediaViewer(_FramelessViewer):
         is_audio = self.path.suffix.lower() in AUDIO_EXTS
         self.is_audio = is_audio
         self._button(self.toolbar_left, "▶ 播放", self.open_external).pack(side=tk.LEFT, padx=(0, 6), pady=8)
+        self._button(self.toolbar_left, "另存为新版本", self.save_source_as_new_version).pack(side=tk.LEFT, padx=(0, 6), pady=8)
         if is_audio:
             self._button(self.toolbar_left, "编辑音频", self.open_audio_editor).pack(side=tk.LEFT, padx=(0, 6), pady=8)
             self._button(self.toolbar_left, "转换格式", self.convert_format).pack(side=tk.LEFT, padx=(0, 6), pady=8)
@@ -4270,7 +4671,7 @@ class MediaViewer(_FramelessViewer):
             on_done=lambda: self._open_audio_editor_path(out_path))
 
     def _open_audio_editor_path(self, path: Path) -> None:
-        editor = AudioEditorWindow(self.app, path)
+        editor = AudioEditorWindow(self.app, path, self.item)
         if not editor.closed:
             self.app.audio_editors.append(editor)
 
@@ -4555,10 +4956,11 @@ class AudioEditorWindow(_FramelessViewer):
     MIN_W = 760
     MIN_H = 480
 
-    def __init__(self, app, path: Path):
+    def __init__(self, app, path: Path, item: DockItem | None = None):
         import numpy as np
         self._np = np
         self.path = Path(path)
+        self.item = item or new_item("file", str(self.path), self.path.name)
         self.sel = None            # (start_sample, end_sample) in self.data 坐标
         self._drag_anchor = None
         self.undo_stack: list = []
@@ -4586,6 +4988,7 @@ class AudioEditorWindow(_FramelessViewer):
             ("裁剪到选区", self.trim_to_selection), ("删除选区", self.delete_selection),
             ("拼接WAV…", self.concat_wav), ("降噪", self.denoise),
             ("撤销", self.undo), ("保存为WAV…", self.save_as),
+            ("另存为新版本", self.save_as_new_version),
         ):
             self._ops_button(effects, label, cmd).pack(
                 side=tk.LEFT, padx=(8 if label == "裁剪到选区" else 0, 4), pady=4)
@@ -4897,6 +5300,15 @@ class AudioEditorWindow(_FramelessViewer):
             pass
         self.app.write_status(f"已保存：{Path(out).name}　时长 {self._fmt_time(len(self.data))}")
 
+    def save_as_new_version(self) -> None:
+        self.stop()
+        self.app.save_item_as_new_version(
+            self.item,
+            writer=lambda destination: write_wav_int16(str(destination), self.data, self.sr),
+            suffix=".wav",
+            source_path=self.path,
+        )
+
     def close(self) -> None:
         if getattr(self, "closed", False):
             return
@@ -4922,6 +5334,7 @@ class ArchiveViewer(_FramelessViewer):
         body = self._build_frame(app, self.path.name)
         self._button(self.toolbar_left, "解压全部…", self.extract_all).pack(side=tk.LEFT, padx=(0, 6), pady=8)
         self._button(self.toolbar_left, "默认程序打开", self.open_external).pack(side=tk.LEFT, padx=(0, 6), pady=8)
+        self._button(self.toolbar_left, "另存为新版本", self.save_source_as_new_version).pack(side=tk.LEFT, padx=(0, 6), pady=8)
 
         columns = ("size", "csize", "mtime")
         self.tree = ttk.Treeview(body, columns=columns, show="tree headings")
@@ -5740,7 +6153,10 @@ class GroupOverlay:
         self.drag_preview_window = None
         self.drag_preview_photo = None
         self.drag_preview_member_id: str | None = None
+        self.drag_target_member_id: str | None = None
         self.external_drag_active = False
+        self.member_tiles: dict[str, tk.Canvas] = {}
+        self.member_photo_refs: list[object] = []
         self._build(group_item)
         self._position(group_item)
         app.keep_window_above_main(self.win)
@@ -5765,14 +6181,28 @@ class GroupOverlay:
             fg="white", activebackground=ACCENT_HOVER, activeforeground="white",
             font=app_font(8, "bold"), cursor="hand2",
         ).pack(side=tk.RIGHT, padx=(0, 8))
+        tk.Button(
+            header, text="排序", command=self._sort_members, bd=0, padx=8, pady=2,
+            bg="#eef2f7", fg="#1f2937", activebackground="#e2e8f0",
+            font=app_font(8), cursor="hand2",
+        ).pack(side=tk.RIGHT, padx=(0, 8))
 
-        grid = tk.Frame(outer, bg=SURFACE_BG)
-        grid.pack(padx=10, pady=(4, 10))
+        self.grid = tk.Frame(outer, bg=SURFACE_BG)
+        self.grid.pack(padx=10, pady=(4, 10))
+        self._refresh_member_grid()
+
+    def _refresh_member_grid(self) -> None:
+        for child in self.grid.winfo_children():
+            child.destroy()
+        self.member_tiles.clear()
+        self.member_photo_refs.clear()
         members = self.app.group_members(self.group_id)
         cols = max(1, min(4, len(members)))
         for index, member in enumerate(members):
             r, c = divmod(index, cols)
-            self._build_member_tile(grid, member).grid(row=r, column=c, padx=4, pady=4)
+            tile = self._build_member_tile(self.grid, member)
+            tile.grid(row=r, column=c, padx=4, pady=4)
+            self.member_tiles[member.id] = tile
 
     def _build_member_tile(self, parent, member: "DockItem"):
         tile = tk.Canvas(
@@ -5781,7 +6211,7 @@ class GroupOverlay:
         )
         photo = self._paint_member_tile(tile, member)
         if photo is not None:
-            self.app.photo_refs.append(photo)
+            self.member_photo_refs.append(photo)
         tile.bind("<Double-Button-1>", lambda event, m=member: self._open_member(m))
         tile.bind("<Button-3>", lambda event, m=member: self._popup_member_menu(event, m))
         tile.bind("<ButtonPress-1>", lambda event, m=member: self._press(event, m))
@@ -5791,7 +6221,10 @@ class GroupOverlay:
         return tile
 
     def _paint_member_tile(self, tile, member: "DockItem"):
-        create_round_rect(tile, 1, 1, self.MINI - 2, self.MINI - 2, radius=10, outline=BORDER, width=1, fill=SURFACE_BG)
+        tile._member_border_id = create_round_rect(
+            tile, 1, 1, self.MINI - 2, self.MINI - 2,
+            radius=10, outline=BORDER, width=1, fill=SURFACE_BG,
+        )
         # Use a slightly smaller, fixed-size icon so the two-line name below never
         # overlaps it.
         photo = None
@@ -5805,6 +6238,12 @@ class GroupOverlay:
             tile.create_image(self.MINI // 2, 34, image=photo, anchor=tk.CENTER)
         else:
             tile.create_text(self.MINI // 2, 34, text=self.app.kind_label(member.kind), fill=MUTED_FG, font=app_font(8))
+        version_count = self.app.history_version_count(member)
+        if version_count:
+            tile.create_text(
+                self.MINI - 7, 7, text=f"+{version_count}", anchor=tk.NE,
+                fill=ACCENT, font=app_font(7, "bold"),
+            )
         name = fit_text_lines(member.display_title, self.app.tile_font, self.MINI - 12, max_lines=2)
         tile.create_text(
             self.MINI // 2, 84, text=name, fill="#111827", justify=tk.CENTER,
@@ -5831,6 +6270,22 @@ class GroupOverlay:
         if group:
             self.app.open_group_all(group)
 
+    def _sort_members(self) -> None:
+        if self.app.sort_group_members_by_filename(self.group_id):
+            self._commit_member_order("组内项目已按文件名排序。")
+        else:
+            self.app.write_status("组内项目已经按文件名排序。")
+
+    def _commit_member_order(self, status: str) -> None:
+        self.app.save()
+        self.app.refresh_group_tile(self.group_id)
+        self._refresh_member_grid()
+        group = self.app.item_by_id(self.group_id)
+        if group is not None:
+            self._position(group)
+        self.app.keep_window_above_main(self.win)
+        self.app.write_status(status)
+
     def _dissolve(self) -> None:
         self.app.dissolve_group(self.group_id)
         self.app.save()
@@ -5840,9 +6295,13 @@ class GroupOverlay:
     def _popup_member_menu(self, event, member: "DockItem") -> None:
         menu = tk.Menu(self.win, tearoff=False)
         menu.add_command(label="打开", command=lambda m=member: self._open_member(m))
+        menu.add_command(label="复制", command=lambda m=member: self._copy(m))
         menu.add_command(label="移出组", command=lambda m=member: self._eject(m))
         menu.add_command(label="从 Passer 移除", command=lambda m=member: self._remove(m))
         menu.tk_popup(event.x_root, event.y_root)
+
+    def _copy(self, member: "DockItem") -> None:
+        self.app.copy_items_default([member])
 
     def _eject(self, member: "DockItem") -> None:
         self.app.remove_from_group(member.id)
@@ -5860,6 +6319,7 @@ class GroupOverlay:
 
     def _press(self, event, member: "DockItem") -> None:
         self._destroy_drag_preview()
+        self._set_drag_target(None)
         self.drag_member_id = member.id
         self.drag_started = False
         self.drag_start_root = (event.x_root, event.y_root)
@@ -5881,8 +6341,14 @@ class GroupOverlay:
             return "break"
 
         member = self.app.item_by_id(self.drag_member_id) if self.drag_member_id else None
+        inside_overlay = self._point_in_overlay(event.x_root, event.y_root)
         inside_passer = self.app.is_inside_main_window(event.x_root, event.y_root)
-        if member is not None and (inside_passer or self._point_in_overlay(event.x_root, event.y_root)):
+        if inside_overlay:
+            target_id = self._member_at_point(event.x_root, event.y_root)
+            self._set_drag_target(target_id if target_id != self.drag_member_id else None)
+        else:
+            self._set_drag_target(None)
+        if member is not None and (inside_passer or inside_overlay):
             self._show_drag_preview(member, event.x_root, event.y_root)
             return "break"
 
@@ -5961,6 +6427,7 @@ class GroupOverlay:
         self.drag_member_id = None
         self.drag_started = False
         self.drag_start_root = None
+        self._set_drag_target(None)
         self._destroy_drag_preview()
         if was_active and action == COPY:
             self.app.write_status("已拖出复制，组内文件保持不变。")
@@ -5968,13 +6435,21 @@ class GroupOverlay:
     def _release(self, event) -> None:
         member_id = self.drag_member_id
         started = self.drag_started
+        target_member_id = self._member_at_point(event.x_root, event.y_root)
         self._destroy_drag_preview()
+        self._set_drag_target(None)
         self.drag_member_id = None
         self.drag_started = False
         self.drag_start_root = None
         if not member_id or not started:
             return
         if self._point_in_overlay(event.x_root, event.y_root):
+            if (
+                target_member_id
+                and target_member_id != member_id
+                and self.app.move_group_member(self.group_id, member_id, target_member_id)
+            ):
+                self._commit_member_order("已调整组内顺序。")
             return
         if self.app.is_inside_main_window(event.x_root, event.y_root):
             cx = event.x_root - self.app.content.winfo_rootx()
@@ -5984,6 +6459,37 @@ class GroupOverlay:
             self.app.save()
             self.app.render_items()
             self.app.write_status("已移出组。")
+
+    def _member_at_point(self, x_root: int, y_root: int) -> str | None:
+        for member_id, tile in self.member_tiles.items():
+            try:
+                if not tile.winfo_ismapped():
+                    continue
+                left = tile.winfo_rootx()
+                top = tile.winfo_rooty()
+                if left <= x_root < left + tile.winfo_width() and top <= y_root < top + tile.winfo_height():
+                    return member_id
+            except tk.TclError:
+                continue
+        return None
+
+    def _set_drag_target(self, member_id: str | None) -> None:
+        if self.drag_target_member_id == member_id:
+            return
+        self.drag_target_member_id = member_id
+        for current_id, tile in self.member_tiles.items():
+            border_id = getattr(tile, "_member_border_id", None)
+            if border_id is None:
+                continue
+            try:
+                active = current_id == member_id
+                tile.itemconfigure(
+                    border_id,
+                    outline=(ACCENT if active else BORDER),
+                    width=(2 if active else 1),
+                )
+            except tk.TclError:
+                continue
 
     def _point_in_overlay(self, x: int, y: int) -> bool:
         try:
@@ -6026,6 +6532,7 @@ class GroupOverlay:
 
     def destroy(self) -> None:
         self._destroy_drag_preview()
+        self.member_photo_refs.clear()
         try:
             self.win.destroy()
         except Exception:
